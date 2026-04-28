@@ -62,8 +62,9 @@ Copy these from `~/dev/GodModeSkill/skill/` to `~/.local/bin/`:
 - `work-pack-build` (Python XML pack assembler)
 - `work-converge` (Python lineage-quorum checker)
 - `work-fleet-restart` (tmux session restarter)
+- `agent-status` (fleet status table + reset-time setter)
 
-Make all four executable: `chmod +x ~/.local/bin/work*`
+Make them executable: `chmod +x ~/.local/bin/work* ~/.local/bin/agent-status`
 
 Verify `~/.local/bin` is in my `PATH`. If not, append `export PATH="$HOME/.local/bin:$PATH"` to my `~/.bashrc` or `~/.zshrc` and tell me to reload my shell.
 
@@ -195,8 +196,6 @@ Tell me:
 2. Where the slash command spec lives so I can customize it: `~/.claude/commands/work.md`
 3. Where to add more agents later: `~/.config/agent-sessions/agents.json`
 4. The full README is at `~/dev/GodModeSkill/README.md`
-
-DO NOT install agent-status if it doesn't exist already — that's a separate tool not included in this skill. If I want it, point me at the GodModeSkill repo for the `agent-status` script (TODO: add to repo).
 
 DONE.
 =================================================================

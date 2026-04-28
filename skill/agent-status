@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# agent-status — refresh $HOME/.config/agent-sessions/status.json and
+# print a status table for all configured AI agent tmux sessions.
+#
+# Usage:
+#   agent-status                              # refresh + print table
+#   agent-status --json                       # refresh + print raw JSON
+#   agent-status --quiet                      # refresh, print nothing
+#   agent-status set-reset <agent> short|weekly <when>
+#       <when> = ISO-8601 timestamp (2026-04-28T15:00:00Z)
+#                or relative (+5h, +90m, +7d)
+#                or "clear" to null it
+
+set -euo pipefail
+
+CFG_DIR="$HOME/.config/agent-sessions"
+AGENTS="$CFG_DIR/agents.json"
+STATUS="$CFG_DIR/status.json"
+ENV_FILE="$HOME/.config/opencode/.env"
+
+[ -f "$AGENTS" ] || { echo "missing $AGENTS"; exit 1; }
+[ -f "$ENV_FILE" ] && source "$ENV_FILE"
+
+# ── Subcommand: set-reset ────────────────────────────────────────────────
+if [ "${1:-}" = "set-reset" ]; then
+  agent="${2:-}"; window="${3:-}"; when="${4:-}"
+  if [ -z "$agent" ] || [ -z "$window" ] || [ -z "$when" ]; then
+    echo "usage: agent-status set-reset <agent> short|weekly <iso-or-+5h-or-clear>" >&2
+    exit 2
+  fi
+  case "$window" in short|weekly) ;; *) echo "window must be 'short' or 'weekly'" >&2; exit 2 ;; esac
+
+  # Resolve <when> to ISO-8601 UTC
+  if [ "$when" = "clear" ]; then
+    iso="null"
+  elif [[ "$when" =~ ^\+([0-9]+)([hmd])$ ]]; then
+    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      h) sec=$((n*3600)) ;;
+      m) sec=$((n*60)) ;;
+      d) sec=$((n*86400)) ;;
+    esac
+    iso="\"$(date -u -d "+$sec seconds" +%Y-%m-%dT%H:%M:%SZ)\""
+  else
+    # Validate ISO by round-tripping through date
+    parsed="$(date -u -d "$when" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+    [ -z "$parsed" ] && { echo "couldn't parse '$when' — use ISO-8601 or +5h/+90m/+7d"; exit 2; }
+    iso="\"$parsed\""
+  fi
+
+  # Update agents.json
+  jq --arg agent "$agent" --arg window "$window" --argjson iso "$iso" '
+    .agents = (.agents | map(
+      if .name == $agent then .rate_limits[$window].next_reset = $iso else . end
+    ))
+  ' "$AGENTS" > "$AGENTS.tmp" && mv "$AGENTS.tmp" "$AGENTS"
+
+  echo "✓ $agent.$window.next_reset = $iso"
+  exit 0
+fi
+
+# ── Refresh ──────────────────────────────────────────────────────────────
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+now_epoch="$(date -u +%s)"
+tmp="$(mktemp)"
+
+tmux_sessions="$(tmux ls -F '#{session_name}' 2>/dev/null || true)"
+is_alive() { grep -Fxq "$1" <<< "$tmux_sessions"; }
+
+# Format epoch seconds as "Xh Ym" / "Xd Yh" countdown (or "EXPIRED")
+fmt_until() {
+  local target=$1 diff=$(( $1 - now_epoch ))
+  if [ "$diff" -le 0 ]; then echo "EXPIRED"; return; fi
+  if [ "$diff" -lt 3600 ]; then printf "%dm" $((diff/60))
+  elif [ "$diff" -lt 86400 ]; then printf "%dh%dm" $((diff/3600)) $(((diff%3600)/60))
+  else printf "%dd%dh" $((diff/86400)) $(((diff%86400)/3600)); fi
+}
+
+echo "{\"updated_at\":\"$now\",\"agents\":[" > "$tmp"
+first=1
+jq -c '.agents[]' "$AGENTS" | while read -r row; do
+  name=$(jq -r '.name' <<< "$row")
+  sess=$(jq -r '.tmux_session' <<< "$row")
+  type=$(jq -r '.type' <<< "$row")
+  model=$(jq -r '.model' <<< "$row")
+  auth=$(jq -r '.auth' <<< "$row")
+  endpoint=$(jq -r '.balance_endpoint // ""' <<< "$row")
+  envvar=$(jq -r '.balance_env // ""' <<< "$row")
+  bjq=$(jq -r '.balance_jq // ""' <<< "$row")
+  unit=$(jq -r '.balance_unit // ""' <<< "$row")
+  short_reset=$(jq -r '.rate_limits.short.next_reset // ""' <<< "$row")
+  weekly_reset=$(jq -r '.rate_limits.weekly.next_reset // ""' <<< "$row")
+
+  alive=false
+  is_alive "$sess" && alive=true
+
+  api_reachable=null
+  balance=null
+  err=""
+
+  if [ -n "$endpoint" ] && [ -n "$envvar" ]; then
+    key="${!envvar:-}"
+    if [ -z "$key" ]; then
+      api_reachable=false; err="missing env $envvar"
+    else
+      resp=$(curl -sS --max-time 8 -H "Authorization: Bearer $key" "$endpoint" 2>&1) || resp="__ERR__$resp"
+      if [[ "$resp" == __ERR__* ]]; then
+        api_reachable=false; err="curl: ${resp#__ERR__}"
+      else
+        api_reachable=true
+        [ -n "$bjq" ] && balance=$(jq -r "$bjq // \"null\"" <<< "$resp" 2>/dev/null || echo null)
+      fi
+    fi
+  fi
+
+  # Compute countdowns
+  short_until=""
+  weekly_until=""
+  if [ -n "$short_reset" ] && [ "$short_reset" != "null" ]; then
+    target=$(date -u -d "$short_reset" +%s 2>/dev/null || echo 0)
+    [ "$target" -gt 0 ] && short_until="$(fmt_until $target)"
+  fi
+  if [ -n "$weekly_reset" ] && [ "$weekly_reset" != "null" ]; then
+    target=$(date -u -d "$weekly_reset" +%s 2>/dev/null || echo 0)
+    [ "$target" -gt 0 ] && weekly_until="$(fmt_until $target)"
+  fi
+
+  [ $first -eq 0 ] && echo "," >> "$tmp"
+  first=0
+
+  jq -n \
+    --arg name "$name" --arg sess "$sess" --arg type "$type" \
+    --arg model "$model" --arg auth "$auth" \
+    --argjson alive "$alive" --argjson api_reachable "$api_reachable" \
+    --arg balance "$balance" --arg unit "$unit" --arg err "$err" \
+    --arg short_reset "$short_reset" --arg short_until "$short_until" \
+    --arg weekly_reset "$weekly_reset" --arg weekly_until "$weekly_until" \
+    --arg now "$now" \
+    '{
+      name: $name, tmux_session: $sess, type: $type, model: $model, auth: $auth,
+      tmux_alive: $alive, api_reachable: $api_reachable,
+      balance: ($balance | if . == "null" or . == "" then null else (tonumber? // .) end),
+      balance_unit: ($unit | if . == "" then null else . end),
+      rate_limits: {
+        short: {
+          next_reset: ($short_reset | if . == "" or . == "null" then null else . end),
+          time_until: ($short_until | if . == "" then null else . end)
+        },
+        weekly: {
+          next_reset: ($weekly_reset | if . == "" or . == "null" then null else . end),
+          time_until: ($weekly_until | if . == "" then null else . end)
+        }
+      },
+      error: ($err | if . == "" then null else . end),
+      checked_at: $now
+    }' >> "$tmp"
+done
+echo "]}" >> "$tmp"
+
+jq -s '.[0]' "$tmp" > "$STATUS"
+rm -f "$tmp"
+
+case "${1:-}" in
+  --quiet) exit 0 ;;
+  --json)  cat "$STATUS"; exit 0 ;;
+esac
+
+# ── Pretty table ─────────────────────────────────────────────────────────
+printf '\n%-10s %-10s %-26s %-5s %-5s %-12s %-9s %-9s\n' \
+  "AGENT" "TMUX" "MODEL" "ALIVE" "REACH" "BALANCE" "RESET 5H" "RESET WK"
+printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────────────"
+jq -r '.agents[] |
+  [
+    .name, .tmux_session, .model,
+    (if .tmux_alive then "✓" else "✗" end),
+    (if .api_reachable == null then "n/a" elif .api_reachable then "✓" else "✗" end),
+    (if .balance == null then "—" else "\(.balance) \(.balance_unit // "")" end),
+    (.rate_limits.short.time_until // "—"),
+    (.rate_limits.weekly.time_until // "—")
+  ] | @tsv' "$STATUS" | \
+while IFS=$'\t' read -r name sess model alive reach bal s5 wk; do
+  printf '%-10s %-10s %-26s %-5s %-5s %-12s %-9s %-9s\n' "$name" "$sess" "$model" "$alive" "$reach" "$bal" "$s5" "$wk"
+done
+
+echo ""
+echo "Status JSON: $STATUS"
+echo "Updated: $now"
+echo ""
+echo "Set a reset:  agent-status set-reset cdx-1 short +5h"
+echo "              agent-status set-reset cdx-1 weekly 2026-05-04T00:00:00Z"
+echo "              agent-status set-reset cdx-1 short clear"

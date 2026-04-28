@@ -60,7 +60,7 @@ cd GodModeSkill
 ```
 
 Targets:
-- `skill/work*` → `~/.local/bin/`
+- `skill/work*` + `skill/agent-status` → `~/.local/bin/`
 - `skill/commands/work.md` → `~/.claude/commands/work.md`
 - `skill/agent-sessions/*` → `~/.config/agent-sessions/` (rename `agents.json.template` → `agents.json` and edit)
 - `skill/gemini/settings.snippet.json` → merge into `~/.gemini/settings.json`
