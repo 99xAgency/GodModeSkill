@@ -234,22 +234,34 @@ def emit_pack(args, ctx: dict) -> str:
             parts.append(f'      <doc path="{esc(str(f))}">{cdata(read_capped(f, 10_000))}</doc>')
         parts.append("    </planning-docs>")
 
-    # Related memory
-    if ctx["memory_files"]:
-        parts.append("    <related-memory>")
-        for f in ctx["memory_files"]:
-            parts.append(f'      <memory file="{esc(f.name)}">{cdata(read_capped(f, 5_000))}</memory>')
-        parts.append("    </related-memory>")
+    # Related memory + journals — skipped on round 2+ because they don't
+    # change between rounds and the reviewer already saw them in round 1.
+    # Saves ~30-60% of pack size on follow-up rounds. Reviewer is reminded
+    # via the <ask> block that they're in round 2+ and to use <prior-rounds>
+    # for cross-round context.
+    if args.round == 1:
+        if ctx["memory_files"]:
+            parts.append("    <related-memory>")
+            for f in ctx["memory_files"]:
+                parts.append(f'      <memory file="{esc(f.name)}">{cdata(read_capped(f, 5_000))}</memory>')
+            parts.append("    </related-memory>")
 
-    # Related journals
-    if ctx["journals"]:
-        parts.append("    <related-journals>")
-        for f, entries in ctx["journals"]:
-            parts.append(f'      <journal name="{esc(f.stem)}" matched-entries="{len(entries)}">')
-            for e in entries:
-                parts.append(f"        <entry>{cdata(e)}</entry>")
-            parts.append("      </journal>")
-        parts.append("    </related-journals>")
+        if ctx["journals"]:
+            parts.append("    <related-journals>")
+            for f, entries in ctx["journals"]:
+                parts.append(f'      <journal name="{esc(f.stem)}" matched-entries="{len(entries)}">')
+                for e in entries:
+                    parts.append(f"        <entry>{cdata(e)}</entry>")
+                parts.append("      </journal>")
+            parts.append("    </related-journals>")
+    else:
+        # Round 2+: emit a stub pointing at round 1's pack for any reviewer
+        # that wants to refresh its memory.
+        skipped_count = len(ctx.get("memory_files") or []) + len(ctx.get("journals") or [])
+        if skipped_count:
+            parts.append(f'    <stable-context-skipped reason="round-{args.round}-no-change-since-round-1" '
+                         f'memory-files-omitted="{len(ctx.get("memory_files") or [])}" '
+                         f'journals-omitted="{len(ctx.get("journals") or [])}"/>')
 
     # Relevant code (changed files for implement/bug modes)
     if ctx["code_files"]:
@@ -357,6 +369,9 @@ def build_ask(mode: str, round_n: int) -> str:
             f"\nROUND {round_n}: read <prior-rounds> first. Has the proposer addressed "
             "your previous findings? If yes, agree. If no, restate what's still wrong "
             "and why. Don't invent NEW critiques unless the revised proposal opened them.\n"
+            "Note: <related-memory> and <related-journals> are intentionally omitted in "
+            "round 2+ (they don't change between rounds — you saw them in round 1). "
+            "If you genuinely need to re-check that context, ask in your verdict reasoning.\n"
         )
     else:
         round_note = ""
@@ -371,7 +386,11 @@ RESPONSE_SCHEMA = """\
 <findings>
   <finding severity="critical|high|medium|low" category="bug|security|architecture|performance|style|test|other">
     <claim>One-sentence description of the issue.</claim>
-    <evidence>File path, line number, or quote from the pack supporting the claim.</evidence>
+    <evidence>
+      <file-path>relative/path/from/repo/root.ext</file-path>
+      <line-number>42</line-number>
+      <quoted-line><![CDATA[the EXACT line from the source file, verbatim, including all whitespace]]></quoted-line>
+    </evidence>
     <suggestion>What you would do differently.</suggestion>
   </finding>
   <!-- repeat <finding> as needed; omit if nothing to flag -->
@@ -381,6 +400,15 @@ RESPONSE_SCHEMA = """\
 </findings>
 
 ## DONE
+
+CRITICAL — self-consistency requirement:
+For each <finding>, the <quoted-line> MUST be the verbatim line from the
+source file you're citing — character-for-character, exactly as it appears.
+The orchestrator runs an automated check that greps the source for that
+quoted line. Findings whose quoted-line cannot be found in the cited file
+are flagged as 'unverified' and DOWNGRADED in the quorum (likely
+hallucination from over-eager review). If you cannot quote the exact line,
+either re-read the source or omit the finding.
 """
 
 

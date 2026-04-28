@@ -143,13 +143,27 @@ Catches a lot of "I think it's done" moments where the model has quietly drifted
 | **Permission prompt** — CLI prompts the reviewer for `cat`/`tee`/`bash` execution | `PROMPT_RE` matches | Auto-approve with the right keystrokes (codex `y`, gemini `2`, opencode `Right Enter` for "Allow always"). Logs the command to `approvals.log`. |
 | **Destructive command** — `rm -rf`, `sudo`, `git push --force`, `DROP TABLE`, ~25 patterns | `DESTRUCTIVE_RE` matches | 🛑 **NOT auto-approved.** Agent stays stuck, orchestrator prints `tmux attach -t <session>`, logs to `destructive-blocks.log`. |
 
+**Peer-swap works for ALL lineages, not just opencode:**
+
+| Lineage | Swap chain | When |
+|---|---|---|
+| 🟠 Codex | `cdx-1 → cdx-2 → cdx-3` (or however many you have) | One ChatGPT account hits its 5h/weekly limit |
+| 🔵 Gemini | `gem-1 → gem-2 → …` | First Google AI account hits daily quota |
+| 🟢 Opencode | `kimi ⇄ deepseek` | OpenCode Go gateway hiccup on one provider |
+
+`try_lineage_swap` finds any alive agent of the same `type` in `agents.json` not already in the run, copies the prompt over, /clears the partner, nudges. Stays on subscription pricing — picks from agents you've already configured.
+
 **See what's been stuck across runs:**
 
 ```bash
+work status        # snapshot of current run: who's working, errored, popup-stuck, done
+work status --watch # refresh every 2s
 work permissions   # last 30 auto-approvals + repeating commands + destructive blocks
 ```
 
-This surfaces bash patterns that prompt repeatedly. Add them to your CLI config (e.g. `~/.config/opencode/opencode.json`'s `permission.bash` block) so they're allowed permanently — no orchestrator round-trip.
+`work status` replaces ad-hoc `tmux capture-pane` debugging. Surfaces a one-line state per agent (WORKING / ERRORED / POPUP-STUCK / PERM-PROMPT / DONE) plus log-line counts.
+
+`work permissions` surfaces bash patterns that prompt repeatedly. Add them to your CLI config (e.g. `~/.config/opencode/opencode.json`'s `permission.bash` block) so they're allowed permanently — no orchestrator round-trip.
 
 ---
 
@@ -184,6 +198,44 @@ When the diff itself gets truncated, the pack emits:
 ```
 
 Prevents reviewers from anchoring on the truncated diff and hallucinating findings about the cut-off portion.
+
+## 🔁 Cross-round packs are diff-only
+
+When a review goes to round 2 (after disagreement + revision), the pack **drops `<related-memory>` and `<related-journals>`** — they don't change between rounds and the reviewer already saw them in round 1. Typical saving: **~65% pack size reduction** on round 2+.
+
+Replaced with a stub:
+
+```xml
+<stable-context-skipped reason="round-2-no-change-since-round-1"
+                        memory-files-omitted="6" journals-omitted="3"/>
+```
+
+Architecture docs, code files, diff, and `<prior-rounds>` (which grows each round) are still included — all the things that matter for re-review. Reviewers are reminded in the `<ask>` block that round-2+ context was intentionally trimmed.
+
+## 🎯 Self-consistency check (anti-hallucination)
+
+Findings now require structured evidence:
+
+```xml
+<finding severity="critical" category="bug">
+  <claim>Unquoted variable in test causes syntax error on empty input.</claim>
+  <evidence>
+    <file-path>scripts/greet.sh</file-path>
+    <line-number>5</line-number>
+    <quoted-line><![CDATA[if [ $name == "admin" ]; then]]></quoted-line>
+  </evidence>
+  <suggestion>Quote it: if [ "$name" = "admin" ]; then</suggestion>
+</finding>
+```
+
+`work-converge` greps the cited file for the `<quoted-line>` (whitespace-tolerant). Findings whose quote can't be located are flagged `verified: false` — likely hallucinations. The output JSON exposes:
+
+```json
+{ "verified_findings": 7, "unverified_findings": 1,
+  "unverified_blockers": [ /* critical/high findings that failed verification */ ] }
+```
+
+Claude can then weight unverified findings lower or ignore them. Direct counter to the gem-1-style anchor-bias hallucination class.
 
 ---
 

@@ -56,14 +56,37 @@ def extract_response(text: str) -> dict:
     verdict = None
     verdict_reason = ""
 
+    def _structured_evidence(elem) -> dict:
+        """Extract <evidence> in either old (text) or new (file-path/line-number/quoted-line) shape."""
+        if elem is None:
+            return {"file_path": "", "line_number": None, "quoted_line": "", "raw": ""}
+        # New structured shape
+        fp = elem.findtext("file-path") or ""
+        ln = elem.findtext("line-number") or ""
+        ql = elem.findtext("quoted-line") or ""
+        if fp.strip() or ql.strip():
+            try:
+                ln_int = int(ln.strip()) if ln.strip() else None
+            except ValueError:
+                ln_int = None
+            return {
+                "file_path": fp.strip(),
+                "line_number": ln_int,
+                "quoted_line": ql.strip("\n"),
+                "raw": "",
+            }
+        # Legacy text-only evidence
+        return {"file_path": "", "line_number": None, "quoted_line": "", "raw": (elem.text or "").strip()}
+
     try:
         root = ET.fromstring(block)
         for f in root.findall("finding"):
+            ev = _structured_evidence(f.find("evidence"))
             findings.append({
                 "severity": (f.get("severity") or "medium").lower(),
                 "category": (f.get("category") or "other").lower(),
                 "claim": (f.findtext("claim") or "").strip(),
-                "evidence": (f.findtext("evidence") or "").strip(),
+                "evidence": ev,
                 "suggestion": (f.findtext("suggestion") or "").strip(),
             })
         v = root.find("verdict")
@@ -71,17 +94,32 @@ def extract_response(text: str) -> dict:
             verdict = (v.get("agree") or "").lower() or None
             verdict_reason = (v.findtext("reasoning") or "").strip()
     except ET.ParseError:
-        # Regex fallback
+        # Regex fallback (legacy reviewers using old flat-text evidence)
         for m in FINDING_RE.finditer(block):
             sev, cat, body = m.groups()
             claim_m = re.search(r"<claim>(.*?)</claim>", body, re.DOTALL)
             evid_m = re.search(r"<evidence>(.*?)</evidence>", body, re.DOTALL)
             sugg_m = re.search(r"<suggestion>(.*?)</suggestion>", body, re.DOTALL)
+            evid_raw = (evid_m.group(1).strip() if evid_m else "")
+            # Try to pull structured sub-fields out of the regex'd evidence too
+            fp_m = re.search(r"<file-path>(.*?)</file-path>", evid_raw, re.DOTALL)
+            ln_m = re.search(r"<line-number>(.*?)</line-number>", evid_raw, re.DOTALL)
+            ql_m = re.search(r"<quoted-line>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</quoted-line>", evid_raw, re.DOTALL)
+            try:
+                ln_int = int(ln_m.group(1).strip()) if ln_m else None
+            except ValueError:
+                ln_int = None
+            evidence = {
+                "file_path": (fp_m.group(1).strip() if fp_m else ""),
+                "line_number": ln_int,
+                "quoted_line": (ql_m.group(1).strip("\n") if ql_m else ""),
+                "raw": evid_raw if not (fp_m or ql_m) else "",
+            }
             findings.append({
                 "severity": sev.lower(),
                 "category": cat.lower(),
                 "claim": (claim_m.group(1) if claim_m else "").strip(),
-                "evidence": (evid_m.group(1) if evid_m else "").strip(),
+                "evidence": evidence,
                 "suggestion": (sugg_m.group(1) if sugg_m else "").strip(),
             })
         v_match = VERDICT_RE.search(block)
@@ -176,9 +214,53 @@ def main():
         text = f.read_text(errors="replace")
         per_agent[name] = extract_response(text)
 
+    # Self-consistency check: verify each finding's <quoted-line> appears in
+    # the cited file. Findings whose quote can't be located are marked
+    # `verified: false` — likely hallucinations from over-eager review.
+    # Repo root is best-effort: walk up from out_dir to find a .git dir, else cwd.
+    def _find_repo_root(start: Path) -> Path:
+        p = Path.cwd()
+        for parent in [p, *p.parents]:
+            if (parent / ".git").exists():
+                return parent
+        return p
+    repo_root = _find_repo_root(out_dir)
+
+    for name, resp in per_agent.items():
+        for finding in resp["findings"]:
+            ev = finding.get("evidence")
+            if not isinstance(ev, dict):
+                finding["verified"] = None  # legacy shape, can't verify
+                continue
+            ql = (ev.get("quoted_line") or "").strip()
+            fp = (ev.get("file_path") or "").strip()
+            if not ql or not fp:
+                finding["verified"] = None  # not enough info to verify
+                continue
+            # Resolve path against repo root if relative
+            target = Path(fp) if Path(fp).is_absolute() else (repo_root / fp)
+            if not target.exists():
+                finding["verified"] = False
+                finding["verify_reason"] = f"file not found: {target}"
+                continue
+            try:
+                source = target.read_text(errors="replace")
+            except Exception as e:
+                finding["verified"] = None
+                finding["verify_reason"] = f"unreadable: {e}"
+                continue
+            # Compare with whitespace-tolerant match: collapse runs of WS to one space
+            ql_norm = " ".join(ql.split())
+            source_norm = " ".join(source.split())
+            if ql_norm and ql_norm in source_norm:
+                finding["verified"] = True
+            else:
+                finding["verified"] = False
+                finding["verify_reason"] = "quoted-line not found in cited file"
+
     quorum = quorum_check(per_agent, agent_types)
 
-    # Aggregate finding stats
+    # Aggregate finding stats — distinguishes verified vs unverified
     all_findings = []
     for name, resp in per_agent.items():
         for f in resp["findings"]:
@@ -187,6 +269,8 @@ def main():
     sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for f in all_findings:
         sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
+    n_unverified = sum(1 for f in all_findings if f.get("verified") is False)
+    n_verified = sum(1 for f in all_findings if f.get("verified") is True)
 
     output = {
         "decision": quorum["decision"],
@@ -197,7 +281,10 @@ def main():
         "by_lineage": quorum["by_lineage"],
         "severity_counts": sev_counts,
         "total_findings": len(all_findings),
+        "verified_findings": n_verified,
+        "unverified_findings": n_unverified,
         "blockers": [f for f in all_findings if f["severity"] in ("critical", "high")],
+        "unverified_blockers": [f for f in all_findings if f["severity"] in ("critical", "high") and f.get("verified") is False],
     }
 
     print(json.dumps(output, indent=2))

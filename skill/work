@@ -490,9 +490,12 @@ declare -A ERROR_GAVE_UP     # agent -> 1 if 2nd error fired
 declare -A SWAPPED_TO        # agent -> partner we swapped IN as replacement
 declare -A POPUP_DISMISSED_AT # agent -> last unix ts we sent Escape
 
-# Opencode-specific: kimi ⇄ deepseek bi-directional swap on persistent error.
-# Requirement: stay on subscription (OpenCode Go), do NOT fall back to API keys.
-declare -A OPENCODE_PARTNER=( [kimi]=deepseek [deepseek]=kimi )
+# Per-lineage peer-swap on persistent error. When an agent fails (provider
+# error, rate limit, repeat popup), find the next alive agent of the SAME
+# lineage from agents.json and swap it in. Replaces the old hardcoded
+# OPENCODE_PARTNER map — works for codex (cdx-1→2→3), gemini (gem-1→2→…),
+# and opencode (kimi→deepseek and reverse).
+declare -A SWAP_TRIED  # "agent_failed" -> "agent_tried_as_replacement"
 
 # Modal popups that opencode raises mid-flight (Select agent / Select model
 # triggered by stray @ or / in pasted prompt; "No results found" Ask popup).
@@ -587,39 +590,63 @@ check_for_popups() {
   fi
 }
 
-# ── Opencode peer-swap on persistent error ──────────────────────────────
-# Requirement (user): on repeated kimi error → take over with deepseek;
-# on repeated deepseek error → take over with kimi. Stay on OpenCode Go
-# subscription, do NOT fall back to API-key providers.
+# ── Per-lineage peer-swap on persistent error ───────────────────────────
+# Find the next alive agent of the SAME lineage as the failed agent, swap
+# it in, nudge it with the same prompt. Works for any lineage (codex,
+# gemini, opencode). Stays on subscription pricing — picks from agents.json
+# which the user has set up with their preferred providers.
 # Returns 0 if swap performed, 1 otherwise (caller falls back to escalation).
-try_opencode_swap() {
+try_lineage_swap() {
   local failed="$1"
-  local partner="${OPENCODE_PARTNER[$failed]:-}"
+  local failed_type="${TYPE[$failed]:-}"
+  [ -z "$failed_type" ] && return 1
+
+  # Find candidate replacement: same type, alive tmux session, not already
+  # in VALID, not already tried as a swap-target. LRU-ordered (oldest first
+  # = least-recently-used = most likely to have quota).
+  local candidates
+  candidates=$(jq -r --arg t "$failed_type" --arg failed "$failed" '
+    .agents[]
+    | select(.type == $t and .name != $failed)
+    | .name
+  ' "$AGENTS_JSON")
+
+  local partner=""
+  local c
+  for c in $candidates; do
+    # Already in VALID? skip (would double-up the lineage)
+    local in_valid=0
+    local v
+    for v in "${VALID[@]}"; do [ "$v" = "$c" ] && in_valid=1; done
+    [ "$in_valid" = "1" ] && continue
+
+    # Already tried as a swap target this run? skip
+    [ "${SWAPPED_TO[$c]:-0}" = "1" ] && continue
+
+    # tmux session alive?
+    local sess_name
+    sess_name=$(jq -r --arg n "$c" '.agents[] | select(.name == $n) | .tmux_session' "$AGENTS_JSON")
+    tmux has-session -t "$sess_name" 2>/dev/null || continue
+
+    partner="$c"
+    break
+  done
+
   [ -z "$partner" ] && return 1
 
-  # Don't swap if partner is already in VALID (would double-up the lineage)
-  local v
-  for v in "${VALID[@]}"; do
-    [ "$v" = "$partner" ] && return 1
-  done
-  # Don't swap if we already swapped TO this partner from another failure
-  [ "${SWAPPED_TO[$partner]:-0}" = "1" ] && return 1
-
-  # Resolve partner metadata from agents.json (not pre-loaded)
+  # Resolve partner metadata
   local row
   row=$(jq -c --arg n "$partner" '.agents[] | select(.name == $n)' "$AGENTS_JSON")
-  [ -z "$row" ] && return 1
   NUDGE[$partner]=$(jq -r '.nudge_command' <<<"$row")
   ENVVAR[$partner]=$(jq -r '.tmux_env_var' <<<"$row")
   SESS[$partner]=$(jq -r '.tmux_session' <<<"$row")
   TYPE[$partner]=$(jq -r '.type' <<<"$row")
 
-  # Partner tmux session must be alive
-  tmux has-session -t "${SESS[$partner]}" 2>/dev/null || return 1
-
   SWAPPED_TO[$partner]=1
-  printf '  ⇄ %-12s opencode peer-swap → %s (taking over from failed %s)\n' "$partner" "$partner" "$failed" >&2
-  echo "$failed → $partner: $(date -Iseconds): peer-swap on persistent error" >> "$out/error-retries.log" 2>/dev/null || true
+  SWAP_TRIED[$failed]="$partner"
+  printf '  ⇄ %-12s %s peer-swap → %s (taking over from failed %s)\n' \
+    "$partner" "$failed_type" "$partner" "$failed" >&2
+  echo "$failed → $partner: $(date -Iseconds): peer-swap on persistent error ($failed_type lineage)" >> "$out/error-retries.log" 2>/dev/null || true
 
   # Initialise partner tracking
   LAST_PROMPT[$partner]="${LAST_PROMPT[$failed]}"
@@ -628,17 +655,22 @@ try_opencode_swap() {
   ERROR_RETRIED_AT[$partner]=0
   ERROR_GAVE_UP[$partner]=0
 
-  # Initialise findings file (so watcher tracks it)
-  printf '# Findings — %s\n\n_(swapped in at %s, replacing %s)_\n' \
-    "$partner" "$(date -u -Iseconds)" "$failed" > "$out/${partner}-findings.md"
+  # Initialise findings file
+  printf '# Findings — %s\n\n_(swapped in at %s, replacing %s of same %s lineage)_\n' \
+    "$partner" "$(date -u -Iseconds)" "$failed" "$failed_type" > "$out/${partner}-findings.md"
 
   # Add to VALID so the watcher waits for its ## DONE
   VALID+=("$partner")
 
-  # /new the partner (always-clear opencode policy)
-  tmux send-keys -t "${SESS[$partner]}" "/new" Enter 2>/dev/null || true
-  sleep 2
-  # Defensive Escape in case partner has its own stale popup
+  # Per-CLI clear: opencode → /new, codex+gemini → /clear (only for opencode
+  # since codex/gemini may carry useful context across rounds; the partner
+  # being a different account/session means it has no carry-over anyway,
+  # but a /clear is cheap insurance).
+  case "$failed_type" in
+    opencode) tmux send-keys -t "${SESS[$partner]}" "/new" Enter 2>/dev/null || true ; sleep 2 ;;
+    *)        tmux send-keys -t "${SESS[$partner]}" "/clear" Enter 2>/dev/null || true ; sleep 1 ;;
+  esac
+  # Defensive Escape in case partner has its own stale popup (opencode)
   tmux send-keys -t "${SESS[$partner]}" Escape 2>/dev/null || true
   sleep 0.5
 
@@ -681,13 +713,14 @@ check_for_errors() {
     env "${LAST_NUDGE_ENV[$name]}=${SESS[$name]}" "${LAST_NUDGE[$name]}" "${LAST_PROMPT[$name]}" >/dev/null 2>&1 || true
   elif [ $((now - last)) -ge 60 ]; then
     ERROR_GAVE_UP[$name]=1
-    # First try peer-swap for opencode (kimi ⇄ deepseek). If swap succeeds,
-    # the failed agent gets a stub-DONE here AND the partner is now reviewing.
-    # If swap fails (partner missing/dead/already-in-VALID), escalate as before.
-    if [ "${TYPE[$name]:-}" = "opencode" ] && try_opencode_swap "$name"; then
+    # First try peer-swap within the same lineage. Works for codex
+    # (cdx-1→2→3), gemini (gem-1→2→…), and opencode (kimi⇄deepseek).
+    # If a swap succeeds, the failed agent gets a stub-DONE here AND the
+    # partner is now reviewing. If no swap candidate is available, escalate.
+    if try_lineage_swap "$name"; then
       printf '  ✗ %-12s marked done with stub (peer-swap took over)\n' "$name" >&2
     else
-      printf '  ✗ %-12s provider error AGAIN — escalating to Claude (stub findings written)\n' "$name" >&2
+      printf '  ✗ %-12s provider error AGAIN — no swap candidate, escalating to Claude (stub findings written)\n' "$name" >&2
     fi
     echo "$name: $(date -Iseconds): second error, escalating to Claude" >> "$out/error-retries.log" 2>/dev/null || true
     # Escalation: write a stub findings file so the watcher exits its inotify
@@ -724,6 +757,115 @@ STUB
   fi
   # <60s after retry: still in retry-grace window, ignore (TUI may be
   # repainting the previous error frame).
+}
+
+cmd_status() {
+  # Live snapshot of the most-recent /work run. Replaces ad-hoc
+  # "tmux capture-pane -t kimi" + "ls -la /tmp/work-*" gymnastics.
+  # Usage: work status [--watch] [--run <out-dir>]
+  local watch=0 explicit_run=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --watch)   watch=1; shift ;;
+      --run)     explicit_run="$2"; shift 2 ;;
+      -h|--help) echo "work status [--watch] [--run <dir>]" >&2; return 0 ;;
+      *)         echo "work status: unknown flag $1" >&2; return 2 ;;
+    esac
+  done
+
+  local run_dir
+  if [ -n "$explicit_run" ]; then
+    run_dir="$explicit_run"
+  else
+    run_dir=$(ls -dt /tmp/work-*-r*-* 2>/dev/null | head -1 || true)
+  fi
+  [ -z "$run_dir" ] || [ ! -d "$run_dir" ] && {
+    echo "work status: no /work runs found in /tmp/work-*-r*-*" >&2
+    return 1
+  }
+
+  _render_status() {
+    local rd="$1"
+    local now_iso
+    now_iso=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '\033[1;36m▶ %s\033[0m  (refresh: %s)\n\n' "$(basename "$rd")" "$now_iso"
+
+    # Discover agents = files matching <name>-findings.md
+    local findings_files
+    mapfile -t findings_files < <(ls "$rd"/*-findings.md 2>/dev/null)
+    [ ${#findings_files[@]} -eq 0 ] && { echo "  (no findings files yet)"; return; }
+
+    # Header
+    printf '  %-12s %-10s %-9s %-6s %-9s %s\n' \
+      "AGENT" "TMUX" "ELAPSED" "DONE?" "BYTES" "STATE"
+    printf '  %s\n' "------------ ---------- --------- ----- --------- -----"
+
+    local f name session=""
+    for f in "${findings_files[@]}"; do
+      name=$(basename "$f" -findings.md)
+      session=$(jq -r --arg n "$name" '.agents[] | select(.name == $n) | .tmux_session // ""' "$AGENTS_JSON" 2>/dev/null)
+      session="${session:-?}"
+
+      # Elapsed since file creation (proxy for nudge time)
+      local mtime now elapsed_s elapsed_str
+      mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      elapsed_s=$((now - mtime))
+      if [ "$elapsed_s" -lt 60 ]; then elapsed_str="${elapsed_s}s"
+      elif [ "$elapsed_s" -lt 3600 ]; then elapsed_str="$((elapsed_s/60))m$((elapsed_s%60))s"
+      else elapsed_str="$((elapsed_s/3600))h$((elapsed_s/60%60))m"
+      fi
+
+      # DONE marker?
+      local done_str="✗"
+      if tail -3 "$f" 2>/dev/null | grep -qE '^## DONE\s*$'; then
+        done_str="✓"
+      fi
+
+      # File size
+      local bytes
+      bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
+
+      # Pane state
+      local state pane=""
+      pane=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -30 || true)
+      if [ "$done_str" = "✓" ]; then
+        state="\033[1;32mDONE\033[0m"
+      elif echo "$pane" | grep -qiE 'Error from provider|Provider returned error|rate limit|429 Too Many|503 Service|context (length|window) exceeded'; then
+        state="\033[1;31mERRORED\033[0m"
+      elif echo "$pane" | grep -qE 'Select agent|Select model|Select session|^[[:space:]]*Ask[[:space:]]+No results found'; then
+        state="\033[1;33mPOPUP-STUCK\033[0m"
+      elif echo "$pane" | grep -qiE 'Allow this|Allow execution|Allow once|Approve this|\(y/N\)|\[y/N\]'; then
+        state="\033[1;33mPERM-PROMPT\033[0m"
+      elif echo "$pane" | grep -qiE 'Working|Thinking|in progress|generating|reading|writing'; then
+        state="\033[1;34mWORKING\033[0m"
+      else
+        state="\033[2midle?\033[0m"
+      fi
+
+      printf "  %-12s %-10s %-9s %-6s %-9s ${state}\n" \
+        "$name" "$session" "$elapsed_str" "$done_str" "$bytes"
+    done
+
+    # Side-channel logs
+    echo ""
+    local n_err n_pop n_dest n_appr
+    n_err=$([ -f "$rd/error-retries.log" ] && wc -l < "$rd/error-retries.log" | tr -d ' ' || echo 0)
+    n_pop=$([ -f "$rd/popup-dismissals.log" ] && wc -l < "$rd/popup-dismissals.log" | tr -d ' ' || echo 0)
+    n_dest=$([ -f "$rd/destructive-blocks.log" ] && wc -l < "$rd/destructive-blocks.log" | tr -d ' ' || echo 0)
+    n_appr=$([ -f "$rd/approvals.log" ] && wc -l < "$rd/approvals.log" | tr -d ' ' || echo 0)
+    printf '  Logs:  errors=%s  popups=%s  blocks=%s  approvals=%s\n' "$n_err" "$n_pop" "$n_dest" "$n_appr"
+  }
+
+  if [ "$watch" -eq 1 ]; then
+    while :; do
+      clear
+      _render_status "$run_dir"
+      sleep 2
+    done
+  else
+    _render_status "$run_dir"
+  fi
 }
 
 cmd_permissions() {
@@ -763,12 +905,13 @@ HOW
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────
-[ $# -eq 0 ] && { echo "work: usage: work {pick-agents|review|state-get|state-set|clean|permissions} ..." >&2; exit 2; }
+[ $# -eq 0 ] && { echo "work: usage: work {pick-agents|review|status|state-get|state-set|clean|permissions} ..." >&2; exit 2; }
 
 sub="$1"; shift
 case "$sub" in
   pick-agents) cmd_pick_agents "$@" ;;
   review)      cmd_review "$@" ;;
+  status)      cmd_status "$@" ;;
   state-get)   cmd_state_get ;;
   state-set)   cmd_state_set "$@" ;;
   clean)       cmd_clean "$@" ;;
