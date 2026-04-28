@@ -33,6 +33,15 @@ def load_agent_types(agents_json: Path) -> dict[str, str]:
     return {a["name"]: a["type"] for a in data["agents"]}
 
 
+def disabled_lineages(agents_json: Path) -> set[str]:
+    """Lineages where every configured agent is marked disabled."""
+    data = json.loads(agents_json.read_text())
+    by_lin: dict[str, list[bool]] = {}
+    for a in data["agents"]:
+        by_lin.setdefault(a["type"], []).append(bool(a.get("disabled", False)))
+    return {lin for lin, flags in by_lin.items() if flags and all(flags)}
+
+
 # Reviewers may wrap their XML in markdown chatter; pull just the <findings> block.
 FINDINGS_RE = re.compile(r"<findings>.*?</findings>", re.DOTALL | re.IGNORECASE)
 VERDICT_RE = re.compile(
@@ -136,13 +145,16 @@ def extract_response(text: str) -> dict:
     }
 
 
-def quorum_check(per_agent: dict, agent_types: dict[str, str]) -> dict:
+def quorum_check(per_agent: dict, agent_types: dict[str, str], disabled: set[str] | None = None) -> dict:
     """
     Lineage-weighted quorum:
-      need ≥1 agent of each {codex, gemini, opencode} to return verdict=true.
+      need ≥1 agent of each ENABLED lineage to return verdict=true.
+      Lineages with all agents disabled are marked "disabled" and don't
+      block the decision (degraded quorum — user has explicitly opted out).
       verdict=partial counts as agree IFF the reviewer's findings list has no
       severity in {critical, high} (i.e. only nits).
     """
+    disabled = disabled or set()
     by_lineage = {"codex": [], "gemini": [], "opencode": []}
     for agent_name, resp in per_agent.items():
         lin = agent_types.get(agent_name)
@@ -150,8 +162,6 @@ def quorum_check(per_agent: dict, agent_types: dict[str, str]) -> dict:
             continue
 
         v = resp["verdict"]
-        # Missing verdict (no file, malformed file, or no <verdict> block)
-        # → don't count as disagree; treat as MISSING for that lineage.
         if v is None:
             continue
 
@@ -167,23 +177,27 @@ def quorum_check(per_agent: dict, agent_types: dict[str, str]) -> dict:
 
     lineage_status = {}
     for lin, agents in by_lineage.items():
-        if not agents:
+        if lin in disabled:
+            lineage_status[lin] = "disabled"
+        elif not agents:
             lineage_status[lin] = "missing"
         elif any(a["agree"] for a in agents):
             lineage_status[lin] = "agree"
         else:
             lineage_status[lin] = "disagree"
 
-    # Decision
+    # Decision: disabled lineages don't block. Missing (active but no response)
+    # → incomplete. Disagree → revise + retry.
     missing = [l for l, s in lineage_status.items() if s == "missing"]
     disagree = [l for l, s in lineage_status.items() if s == "disagree"]
+    disabled_seen = [l for l, s in lineage_status.items() if s == "disabled"]
 
     if missing and not disagree:
-        decision = "incomplete"  # exit 2
+        decision = "incomplete"
     elif not missing and not disagree:
-        decision = "agree"  # exit 0
+        decision = "agree"
     else:
-        decision = "disagree"  # exit 1
+        decision = "disagree"
 
     return {
         "decision": decision,
@@ -191,6 +205,7 @@ def quorum_check(per_agent: dict, agent_types: dict[str, str]) -> dict:
         "lineage_status": lineage_status,
         "missing_lineages": missing,
         "disagreeing_lineages": disagree,
+        "disabled_lineages": disabled_seen,
     }
 
 
@@ -258,7 +273,7 @@ def main():
                 finding["verified"] = False
                 finding["verify_reason"] = "quoted-line not found in cited file"
 
-    quorum = quorum_check(per_agent, agent_types)
+    quorum = quorum_check(per_agent, agent_types, disabled_lineages(Path(args.agents_json)))
 
     # Aggregate finding stats — distinguishes verified vs unverified
     all_findings = []

@@ -72,26 +72,35 @@ def alive(session):
     return r.returncode == 0
 
 picked = {}
+disabled_lineages = []
 for lineage in ("codex", "gemini", "opencode"):
     pool = [
         a for a in agents
         if a["type"] == lineage
         and a["name"] not in exclude
+        and not a.get("disabled", False)
         and alive(a["tmux_session"])
     ]
     if not pool:
+        # Distinguish "all agents of this lineage are disabled" (degraded
+        # quorum is OK — work-converge will tolerate the missing lineage)
+        # from "lineage has no agents at all" (config issue).
+        all_of_type = [a for a in agents if a["type"] == lineage]
+        all_disabled = all_of_type and all(a.get("disabled", False) for a in all_of_type)
+        if all_disabled:
+            disabled_lineages.append(lineage)
+            continue
         print(json.dumps({"error": f"no alive {lineage} agent available",
                           "exclude": list(exclude)}), file=sys.stderr)
         sys.exit(1)
-    # Sort by (priority asc, last_used_at asc).
-    # Lower priority number = preferred. Default 100 if unset.
-    # Within same priority, LRU wins (oldest used first).
     pool.sort(key=lambda a: (
         a.get("priority", 100),
         lru.get(a["name"], "1970-01-01T00:00:00Z"),
     ))
     picked[lineage] = pool[0]["name"]
 
+if disabled_lineages:
+    picked["_disabled_lineages"] = disabled_lineages
 print(json.dumps(picked, indent=2))
 PYEOF
 }
@@ -198,7 +207,10 @@ cmd_review() {
   if [ -z "$agents" ]; then
     local picks
     picks=$(cmd_pick_agents) || { echo "$picks" >&2; exit 2; }
-    agents=$(echo "$picks" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(d.values()))')
+    agents=$(echo "$picks" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+# Strip meta fields like _disabled_lineages — only emit actual agent names
+print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v, str)))')
   fi
 
   # Default out dir
@@ -929,7 +941,12 @@ cmd_status() {
     local bytes="$4"
     local elapsed_s="$5"
     local sess_alive="$6"  # 1 if tmux has-session, 0 otherwise
+    local is_disabled="$7" # 1 if disabled in agents.json, 0 otherwise
 
+    if [ "$is_disabled" = "1" ]; then
+      printf '\033[1;30mDISABLED\033[0m'
+      return
+    fi
     if [ "$sess_alive" = "0" ]; then
       printf '\033[1;31mDEAD\033[0m (no tmux session)'
       return
@@ -999,15 +1016,16 @@ cmd_status() {
     # the run still get a pane-state summary so the user sees the whole fleet.
     local all_agents
     # Sort: type alphabetically (codex → gemini → opencode), then name.
-    # Lets the display group lineages together.
-    mapfile -t all_agents < <(jq -r '.agents[] | "\(.type)\t\(.name)\t\(.tmux_session)"' "$AGENTS_JSON" | sort -t$'\t' -k1,1 -k2,2)
+    mapfile -t all_agents < <(jq -r '.agents[] | "\(.type)\t\(.name)\t\(.tmux_session)\t\(.disabled // false)"' "$AGENTS_JSON" | sort -t$'\t' -k1,1 -k2,2)
 
-    local row name session
+    local row name session is_disabled
     local f mtime elapsed_s elapsed_str done_str bytes pane in_run sess_alive state
     for row in "${all_agents[@]}"; do
-      # Format is now: type \t name \t session
+      # Format: type \t name \t session \t disabled
       name=$(echo "$row" | cut -f2)
       session=$(echo "$row" | cut -f3)
+      is_disabled=$(echo "$row" | cut -f4)
+      [ "$is_disabled" = "true" ] && is_disabled=1 || is_disabled=0
       [ -z "$name" ] && continue
 
       # tmux session alive?
@@ -1040,7 +1058,7 @@ cmd_status() {
         done_str="-"
       fi
 
-      state=$(_state_for "$pane" "$in_run" "$done_str" "$bytes" "$elapsed_s" "$sess_alive")
+      state=$(_state_for "$pane" "$in_run" "$done_str" "$bytes" "$elapsed_s" "$sess_alive" "$is_disabled")
 
       # Display: bytes column uses '-' instead of 0 when not in run
       local bytes_col="$bytes"
