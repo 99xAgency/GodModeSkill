@@ -23,17 +23,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
-# Claude Code stores per-project memory under ~/.claude/projects/<slug>/memory/
-# where <slug> = absolute cwd with /'s replaced by -'s.
+MEMORY_DIR = HOME / ".claude/projects/-home-ubuntu/memory"
 JOURNAL_DIR = HOME / ".claude/conversations"
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
-
-def project_memory_dir(cwd: Path) -> Path:
-    """Compute the per-project memory dir for the current cwd."""
-    slug = str(cwd.resolve()).replace("/", "-")
-    return HOME / ".claude/projects" / slug / "memory"
-
-MAX_CTX_BYTES = 200_000  # cap pack size — prevents 1MB packs blowing reviewer ctx
+MAX_CTX_BYTES = 800_000  # cap pack size — reviewers have 1M+ ctx (Opus 4.7, Gemini 3.1 Pro, Kimi K2.6)
 MAX_FILE_BYTES = 30_000  # per-file cap when including code
 MAX_JOURNAL_ENTRIES = 5  # most recent entries from any matched journal
 
@@ -84,13 +78,12 @@ def keywords_from_task(task: str) -> list[str]:
     return out
 
 
-def discover_memory_files(keywords: list[str], cwd: Path, limit: int = 6) -> list[Path]:
+def discover_memory_files(keywords: list[str], limit: int = 6) -> list[Path]:
     """Find memory files whose name OR description matches any keyword."""
-    memory_dir = project_memory_dir(cwd)
-    if not memory_dir.exists() or not keywords:
+    if not MEMORY_DIR.exists() or not keywords:
         return []
     matches: dict[Path, int] = {}
-    for f in memory_dir.glob("*.md"):
+    for f in MEMORY_DIR.glob("*.md"):
         if f.name.startswith("_session_") or f.name == "MEMORY.md":
             continue
         score = 0
@@ -276,11 +269,32 @@ def emit_pack(args, ctx: dict) -> str:
 
     # Diff
     if ctx.get("diff"):
-        parts.append("    <diff>")
+        truncated_from = ctx.get("diff_truncated_from")
+        if truncated_from:
+            parts.append(f'    <diff truncated="true" original-bytes="{truncated_from}" shown-bytes="{len(ctx["diff"])}">')
+        else:
+            parts.append("    <diff>")
         parts.append(f"      {cdata(ctx['diff'])}")
         parts.append("    </diff>")
 
     parts.append("  </context>")
+
+    # Reviewer instruction injected ONLY when truncation fired — tells the
+    # reviewer not to anchor on the truncated diff. Without this, reviewers
+    # report findings that are visible in the truncated portion but
+    # contradicted by the full <code_files> attachments above.
+    if ctx.get("diff_truncated_from"):
+        truncation_warning = (
+            "The <diff> block was truncated to fit pack size. The full source files "
+            "are included as <code_file> blocks above. For EVERY finding you report, "
+            "verify the claim against the relevant <code_file> block — do NOT rely "
+            "on the truncated diff alone. If a claim cannot be verified against a "
+            "<code_file>, omit the finding rather than reporting a "
+            "possibly-truncation-induced hallucination."
+        )
+        parts.append('  <reviewer-instruction priority="critical">')
+        parts.append(f"    {cdata(truncation_warning)}")
+        parts.append("  </reviewer-instruction>")
 
     # Prior rounds
     if args.prior_rounds_file and Path(args.prior_rounds_file).exists():
@@ -394,7 +408,7 @@ def main():
     ctx = {
         "arch_docs": find_arch_docs(cwd) if args.mode == "plan" else find_arch_docs(cwd)[:2],
         "planning_docs": [],
-        "memory_files": discover_memory_files(keywords, cwd),
+        "memory_files": discover_memory_files(keywords),
         "journals": discover_journals(keywords),
         "code_files": [],
         "diff": "",
@@ -448,8 +462,12 @@ def main():
         ctx["memory_files"] = ctx["memory_files"][:2]
         xml = emit_pack(args, ctx)
     if len(xml) > MAX_CTX_BYTES:
-        # Last resort: truncate diff
+        # Last resort: truncate diff. Record original size so emit_pack can
+        # warn the reviewer to cross-check code_files instead of trusting
+        # the truncated diff (saw gem-1 hallucinate findings from anchor-bias
+        # on a 50KB-truncated diff while ignoring full <code_files> blocks).
         if ctx.get("diff"):
+            ctx["diff_truncated_from"] = len(ctx["diff"])
             ctx["diff"] = ctx["diff"][:50_000] + "\n[diff truncated for size]"
             xml = emit_pack(args, ctx)
 

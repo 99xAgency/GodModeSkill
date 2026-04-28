@@ -39,7 +39,7 @@ STATE_DIR="$HOME/.work"
 STATE_FILE="$STATE_DIR/state.json"
 LRU_FILE="$STATE_DIR/agent-lru.json"
 sudo mkdir -p "$STATE_DIR" 2>/dev/null || mkdir -p "$STATE_DIR"
-sudo chown -R "$USER:$USER" "$STATE_DIR" 2>/dev/null || true
+sudo chown -R ubuntu:ubuntu "$STATE_DIR" 2>/dev/null || true
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 [ -f "$LRU_FILE"   ] || echo '{}' > "$LRU_FILE"
 
@@ -310,7 +310,32 @@ cmd_review() {
   # Send the nudge to each agent
   for name in "${VALID[@]}"; do
     out_file="$out/${name}-findings.md"
-    prompt="Please review the XML context pack at: $pack_path
+
+    # Per-CLI prompt format. Each TUI handles multi-line input differently:
+    #   • Codex: bracketed-paste safe, multi-line OK, parses paths verbatim.
+    #   • Gemini: each \n inside the input box is treated as Submit — a multi-
+    #     paragraph paste gets fired as 8 separate one-line queries, with
+    #     only the last paragraph landing in the input box. MUST be single-
+    #     line, and uses @<abs-path> syntax for inline file attach.
+    #   • Opencode: multi-line OK with bracketed paste, but tends to drift
+    #     conversational without an explicit "begin immediately" directive.
+    case "${TYPE[$name]}" in
+      gemini)
+        # Single line — no \n anywhere. @-attach reads the pack file inline,
+        # bypassing any need for the agent to call ReadFile itself.
+        prompt="Review @${pack_path} — read the <ask> and <response-schema> blocks, then write the XML findings to ${out_file} using your write_file tool (NOT cat/echo/tee/printf, which prompt for shell permission). End the file with a single line: ## DONE — without it the orchestrator hangs. Begin immediately, do NOT ask clarifying questions."
+        ;;
+      opencode)
+        # Single line — no \n, no leading '/' or '@'. tmux paste-buffer splits
+        # large pastes into ~1.5KB chunks; any '/' or '@' at a chunk boundary
+        # opens opencode's slash-command or agent-picker mid-paste, swallowing
+        # the rest of the prompt (saw this with deepseek showing "Select agent").
+        # Plain prose with absolute paths embedded mid-sentence avoids both.
+        prompt="Round $round reviewer: read the XML pack at ${pack_path} (the ask block says what to review, the response-schema block specifies the exact XML format), then use your write_file tool (NOT cat or echo or tee or printf, which prompt for shell permission) to write your XML findings to ${out_file}, ending the file with a single line containing exactly: ## DONE — without that the orchestrator hangs. Begin immediately, do NOT ask clarifying questions, do NOT respond conversationally."
+        ;;
+      *)
+        # Codex (default) — multi-line is fine.
+        prompt="Please review the XML context pack at: $pack_path
 
 Read it carefully — the <ask> block tells you what to do, the <response-schema> block tells you the EXACT XML format to return.
 
@@ -324,19 +349,25 @@ CRITICAL — to avoid permission prompts:
 End your file with a single line containing exactly: ## DONE
 
 Failure to end with '## DONE' will leave the orchestrator hanging — please double-check before stopping."
-
-    # Opencode TUIs (kimi, deepseek) tend to ask clarifying questions instead
-    # of executing directly. Append a forcing directive so they treat this as
-    # a non-interactive task. Codex + Gemini are already directive enough.
-    if [ "${TYPE[$name]}" = "opencode" ]; then
-      prompt="$prompt
-
-ADDITIONAL — opencode reviewer directive:
-You are the reviewer for round $round of this task. Begin reviewing IMMEDIATELY. Do NOT ask clarifying questions. Do NOT respond conversationally. Your FIRST action must be reading the pack.xml; your LAST action must be writing the findings file ending with '## DONE'."
-    fi
+        ;;
+    esac
 
     printf '# Findings — %s\n\n_(in progress, started %s)_\n' "$name" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$out_file"
     echo "→ nudging $name (tmux ${SESS[$name]})" >&2
+    LAST_PROMPT[$name]="$prompt"
+    LAST_NUDGE[$name]="${NUDGE[$name]}"
+    LAST_NUDGE_ENV[$name]="${ENVVAR[$name]}"
+    ERROR_RETRIED_AT[$name]=0
+    ERROR_GAVE_UP[$name]=0
+    # Pre-flight Escape on opencode: kills any stale modal popup (Select agent,
+    # Select model, error toast) left over from a previous interrupted nudge.
+    # Cheap, idempotent, no effect if no modal is showing.
+    if [ "${TYPE[$name]}" = "opencode" ]; then
+      tmux send-keys -t "${SESS[$name]}" Escape 2>/dev/null || true
+      sleep 0.3
+      tmux send-keys -t "${SESS[$name]}" Escape 2>/dev/null || true
+      sleep 0.3
+    fi
     env "${ENVVAR[$name]}=${SESS[$name]}" "${NUDGE[$name]}" "$prompt" >/dev/null
 
     # Update LRU
@@ -374,15 +405,19 @@ PYEOF
       break
     fi
 
-    # Check for permission prompts in any reviewer pane while we wait
+    # Check for permission prompts, modal popups, and provider errors in any
+    # reviewer pane. Order matters: dismiss popups first (cheapest fix), then
+    # auto-approve safe perm prompts, then handle provider errors.
     for name in "${VALID[@]}"; do
+      check_for_popups "$name" >&2
       check_and_approve_prompts "$name" >&2
+      check_for_errors "$name" >&2
     done
 
-    # Block until ANY findings file changes (or timeout). 15s safety wake to
-    # re-check permission prompts — catches stuck-on-prompt reviewers within
-    # 15s instead of the previous 60s.
-    inotifywait -qq -e modify -e create "$out/" --timeout 15 2>/dev/null || true
+    # Block until ANY findings file changes (or timeout). 5s safety wake to
+    # re-check permission prompts AND provider errors — catches stuck-on-prompt
+    # or errored reviewers fast (was 15s, was 60s before that).
+    inotifywait -qq -e modify -e create "$out/" --timeout 5 2>/dev/null || true
   done
 
   echo "  ✓ All ${done_count}/${#VALID[@]} reviewers done in ${elapsed}s" >&2
@@ -441,6 +476,30 @@ DESTRUCTIVE_RE='\brm -rf\b|\brm -fr\b|\brm +-r +-f\b|\bsudo\b|\bDROP +TABLE\b|\b
 declare -A APPROVED_AT
 declare -A DESTRUCTIVE_FLAGGED
 
+# Provider/transport errors surfaced by reviewer TUIs (opencode toast,
+# gemini inline, codex inline). Distinct from permission prompts — these
+# mean the upstream LLM call failed (rate limit, gateway hiccup, context
+# overflow). Policy: retry once, then give up and let timeout fire.
+ERROR_RE='Error from provider|Provider returned error|rate limit (reached|exceeded)|429 Too Many|503 Service|502 Bad Gateway|context (length|window) exceeded|context_length_exceeded|API request failed|Connection (closed|refused|reset)|ECONNRESET|Too Many Requests|insufficient quota|payment required|model overloaded|service unavailable|Request timed out|fetch failed'
+
+declare -A LAST_PROMPT       # agent -> prompt text (for retry)
+declare -A LAST_NUDGE        # agent -> nudge command path
+declare -A LAST_NUDGE_ENV    # agent -> tmux-session env var name
+declare -A ERROR_RETRIED_AT  # agent -> unix ts of retry (0 = none yet)
+declare -A ERROR_GAVE_UP     # agent -> 1 if 2nd error fired
+declare -A SWAPPED_TO        # agent -> partner we swapped IN as replacement
+declare -A POPUP_DISMISSED_AT # agent -> last unix ts we sent Escape
+
+# Opencode-specific: kimi ⇄ deepseek bi-directional swap on persistent error.
+# Requirement: stay on subscription (OpenCode Go), do NOT fall back to API keys.
+declare -A OPENCODE_PARTNER=( [kimi]=deepseek [deepseek]=kimi )
+
+# Modal popups that opencode raises mid-flight (Select agent / Select model
+# triggered by stray @ or / in pasted prompt; "No results found" Ask popup).
+# These block the TUI until Escape is pressed — orchestrator must dismiss
+# them or the agent never sees the prompt.
+OPENCODE_POPUP_RE='Select agent|Select model|Select session|^[[:space:]]*Ask[[:space:]]+No results found'
+
 check_and_approve_prompts() {
   local name="$1"
   local sess="${SESS[$name]:-}"
@@ -467,6 +526,16 @@ check_and_approve_prompts() {
   [ $((now - last)) -lt 30 ] && return 0
   APPROVED_AT[$name]=$now
 
+  # Log the request line(s) so the user can see WHAT was approved and decide
+  # whether to permanently allow it via CLI config (codex trust / gemini
+  # policy / opencode permission). Heuristic: capture the line with the
+  # command/tool name (often above the Allow/Approve line).
+  local approved_cmd
+  approved_cmd=$(echo "$pane" | grep -iE 'tool:|command:|run:|^[[:space:]]*\$|Bash\s*\(|shell\s*:' | tail -1 | tr -s ' ' | cut -c1-200)
+  [ -z "$approved_cmd" ] && approved_cmd="(command line not captured — see tmux scrollback)"
+  echo "$(date -Iseconds)	$name	$approved_cmd" >> "$out/approvals.log" 2>/dev/null || true
+  echo "$(date -Iseconds)	$name	$approved_cmd" >> "$HOME/.work/approvals-global.log" 2>/dev/null || true
+
   # Three prompt formats — pick the right keystrokes:
   if echo "$pane" | grep -qE "$OPENCODE_PROMPT_RE"; then
     # Opencode arrow-key prompt: cursor on "Allow once", we want "Allow always".
@@ -484,8 +553,217 @@ check_and_approve_prompts() {
   fi
 }
 
+# ── Opencode modal-popup dismissal ──────────────────────────────────────
+# When opencode TUI shows a "Select agent" / "Select model" picker (triggered
+# by an @ or / character in the pasted prompt mid-bracketed-paste-split),
+# the input box is blocked until Escape. Without dismissal the nudge text
+# is lost and the agent never starts reviewing.
+check_for_popups() {
+  local name="$1"
+  [ "${TYPE[$name]:-}" != "opencode" ] && return 0
+  local sess="${SESS[$name]:-}"
+  [ -z "$sess" ] && return 0
+  local pane
+  pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
+  echo "$pane" | grep -qE "$OPENCODE_POPUP_RE" || return 0
+
+  local now last
+  now=$(date +%s)
+  last="${POPUP_DISMISSED_AT[$name]:-0}"
+  # Debounce: don't keep mashing Escape on the same popup frame
+  [ $((now - last)) -lt 10 ] && return 0
+  POPUP_DISMISSED_AT[$name]=$now
+
+  printf '  ⌫ %-12s opencode modal popup detected — dismissing (Escape×2)\n' "$name" >&2
+  tmux send-keys -t "$sess" Escape 2>/dev/null || true
+  sleep 0.5
+  tmux send-keys -t "$sess" Escape 2>/dev/null || true
+  echo "$name: $(date -Iseconds): popup dismissed" >> "$out/popup-dismissals.log" 2>/dev/null || true
+
+  # Re-nudge so the original prompt actually reaches the TUI (the popup ate it).
+  if [ -n "${LAST_PROMPT[$name]:-}" ]; then
+    sleep 1
+    env "${LAST_NUDGE_ENV[$name]}=${SESS[$name]}" "${LAST_NUDGE[$name]}" "${LAST_PROMPT[$name]}" >/dev/null 2>&1 || true
+  fi
+}
+
+# ── Opencode peer-swap on persistent error ──────────────────────────────
+# Requirement (user): on repeated kimi error → take over with deepseek;
+# on repeated deepseek error → take over with kimi. Stay on OpenCode Go
+# subscription, do NOT fall back to API-key providers.
+# Returns 0 if swap performed, 1 otherwise (caller falls back to escalation).
+try_opencode_swap() {
+  local failed="$1"
+  local partner="${OPENCODE_PARTNER[$failed]:-}"
+  [ -z "$partner" ] && return 1
+
+  # Don't swap if partner is already in VALID (would double-up the lineage)
+  local v
+  for v in "${VALID[@]}"; do
+    [ "$v" = "$partner" ] && return 1
+  done
+  # Don't swap if we already swapped TO this partner from another failure
+  [ "${SWAPPED_TO[$partner]:-0}" = "1" ] && return 1
+
+  # Resolve partner metadata from agents.json (not pre-loaded)
+  local row
+  row=$(jq -c --arg n "$partner" '.agents[] | select(.name == $n)' "$AGENTS_JSON")
+  [ -z "$row" ] && return 1
+  NUDGE[$partner]=$(jq -r '.nudge_command' <<<"$row")
+  ENVVAR[$partner]=$(jq -r '.tmux_env_var' <<<"$row")
+  SESS[$partner]=$(jq -r '.tmux_session' <<<"$row")
+  TYPE[$partner]=$(jq -r '.type' <<<"$row")
+
+  # Partner tmux session must be alive
+  tmux has-session -t "${SESS[$partner]}" 2>/dev/null || return 1
+
+  SWAPPED_TO[$partner]=1
+  printf '  ⇄ %-12s opencode peer-swap → %s (taking over from failed %s)\n' "$partner" "$partner" "$failed" >&2
+  echo "$failed → $partner: $(date -Iseconds): peer-swap on persistent error" >> "$out/error-retries.log" 2>/dev/null || true
+
+  # Initialise partner tracking
+  LAST_PROMPT[$partner]="${LAST_PROMPT[$failed]}"
+  LAST_NUDGE[$partner]="${NUDGE[$partner]}"
+  LAST_NUDGE_ENV[$partner]="${ENVVAR[$partner]}"
+  ERROR_RETRIED_AT[$partner]=0
+  ERROR_GAVE_UP[$partner]=0
+
+  # Initialise findings file (so watcher tracks it)
+  printf '# Findings — %s\n\n_(swapped in at %s, replacing %s)_\n' \
+    "$partner" "$(date -u -Iseconds)" "$failed" > "$out/${partner}-findings.md"
+
+  # Add to VALID so the watcher waits for its ## DONE
+  VALID+=("$partner")
+
+  # /new the partner (always-clear opencode policy)
+  tmux send-keys -t "${SESS[$partner]}" "/new" Enter 2>/dev/null || true
+  sleep 2
+  # Defensive Escape in case partner has its own stale popup
+  tmux send-keys -t "${SESS[$partner]}" Escape 2>/dev/null || true
+  sleep 0.5
+
+  # Nudge partner with the same prompt
+  env "${ENVVAR[$partner]}=${SESS[$partner]}" "${NUDGE[$partner]}" "${LAST_PROMPT[$failed]}" >/dev/null 2>&1 || true
+  return 0
+}
+
+# ── Provider error detection — retry once, then give up ─────────────────
+# Catches "Error from provider", rate limits, gateway hiccups, context
+# overflow. Without this the watcher waits silently until --timeout (600s).
+# Retry policy: 1 attempt, no recurrence handling. If retry succeeds the
+# agent writes findings normally; if it errors a 2nd time we stop nudging
+# and let the natural timeout mark it incomplete.
+check_for_errors() {
+  local name="$1"
+  local sess="${SESS[$name]:-}"
+  [ -z "$sess" ] && return 0
+  [ "${ERROR_GAVE_UP[$name]:-0}" = "1" ] && return 0
+  local pane
+  pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
+  echo "$pane" | grep -qiE "$ERROR_RE" || return 0
+
+  # Skip if pane is also showing findings-being-written content — false
+  # positive from the prompt text itself echoing back.
+  if tail -3 "$out/${name}-findings.md" 2>/dev/null | grep -qE '^## DONE\s*$'; then
+    return 0
+  fi
+
+  local now last
+  now=$(date +%s)
+  last="${ERROR_RETRIED_AT[$name]:-0}"
+
+  if [ "$last" -eq 0 ]; then
+    ERROR_RETRIED_AT[$name]=$now
+    printf '  ⟳ %-12s provider error detected — retrying nudge (1 attempt)\n' "$name" >&2
+    echo "$name: $(date -Iseconds): error detected, retrying" >> "$out/error-retries.log" 2>/dev/null || true
+    # Dismiss any modal toast on opencode before re-nudging.
+    [ "${TYPE[$name]:-}" = "opencode" ] && tmux send-keys -t "$sess" Escape 2>/dev/null && sleep 1
+    env "${LAST_NUDGE_ENV[$name]}=${SESS[$name]}" "${LAST_NUDGE[$name]}" "${LAST_PROMPT[$name]}" >/dev/null 2>&1 || true
+  elif [ $((now - last)) -ge 60 ]; then
+    ERROR_GAVE_UP[$name]=1
+    # First try peer-swap for opencode (kimi ⇄ deepseek). If swap succeeds,
+    # the failed agent gets a stub-DONE here AND the partner is now reviewing.
+    # If swap fails (partner missing/dead/already-in-VALID), escalate as before.
+    if [ "${TYPE[$name]:-}" = "opencode" ] && try_opencode_swap "$name"; then
+      printf '  ✗ %-12s marked done with stub (peer-swap took over)\n' "$name" >&2
+    else
+      printf '  ✗ %-12s provider error AGAIN — escalating to Claude (stub findings written)\n' "$name" >&2
+    fi
+    echo "$name: $(date -Iseconds): second error, escalating to Claude" >> "$out/error-retries.log" 2>/dev/null || true
+    # Escalation: write a stub findings file so the watcher exits its inotify
+    # loop now (not after 600s timeout). No <verdict> block → work-converge
+    # marks this lineage as missing → decision=incomplete → Claude takes over.
+    local first_err_iso
+    first_err_iso=$(date -u -d "@$last" -Iseconds 2>/dev/null || date -u -Iseconds)
+    cat > "$out/${name}-findings.md" <<STUB
+# Findings — $name
+
+> ⚠️ AGENT ESCALATED TO CLAUDE — provider error, auto-retry failed
+
+This reviewer hit a provider error, the orchestrator auto-retried once, and the
+retry also errored. The orchestrator has stopped nudging this agent and is
+handing the decision back to Claude.
+
+**Timeline:**
+- First error detected: $first_err_iso
+- Auto-retry sent immediately
+- Second error detected: $(date -u -Iseconds)
+
+**Inspect:** \`tmux attach -t ${SESS[$name]}\`
+**Full error log:** \`$out/error-retries.log\`
+
+**Claude — choose one:**
+1. Manually clear + re-nudge this agent (\`tmux send-keys -t ${SESS[$name]} /clear Enter\`, then re-run the nudge).
+2. Swap to a different agent of the same lineage (e.g. kimi ⇄ deepseek for opencode lineage). Re-run \`work review\` with the new \`--agents\` list.
+3. Proceed without this lineage — quorum will be \`incomplete\` (exit 2).
+
+(No \`<verdict>\` block intentionally; work-converge classifies this as missing.)
+
+## DONE
+STUB
+  fi
+  # <60s after retry: still in retry-grace window, ignore (TUI may be
+  # repainting the previous error frame).
+}
+
+cmd_permissions() {
+  # Show recent auto-approvals + destructive blocks across all /work runs.
+  # Helps the user spot repeating prompts that should be permanently allowed
+  # via the CLI's own config rather than relying on runtime approval.
+  local log="$HOME/.work/approvals-global.log"
+  local n="${1:-30}"
+  echo "▶ Recent auto-approved prompts (last $n)" >&2
+  if [ ! -s "$log" ]; then
+    echo "  (none yet — log: $log)" >&2
+  else
+    tail -n "$n" "$log" | column -t -s $'\t'
+  fi
+  echo >&2
+  echo "▶ Repeating commands (top 10) — candidates to allow permanently:" >&2
+  if [ -s "$log" ]; then
+    cut -f3- "$log" | sort | uniq -c | sort -rn | head -10
+  fi
+  echo >&2
+  echo "▶ Destructive blocks across recent runs:" >&2
+  find /tmp -maxdepth 2 -name destructive-blocks.log -mtime -7 2>/dev/null | while read -r f; do
+    echo "  $f:" >&2
+    sed 's/^/    /' "$f"
+  done
+  echo >&2
+  echo "▶ How to allow permanently (per CLI):" >&2
+  cat >&2 <<'HOW'
+  • Codex: edit ~/.codex/config.toml — add a [projects."<path>"] block with trust_level = "trusted",
+    or under [sandbox] expand allowed shell commands.
+  • Gemini: edit ~/.gemini/policies/<name>.toml — add allow rules (mirror the structure of
+    00-deny-destructive.toml). Auto-approve mode is set in ~/.gemini/settings.json.
+  • Opencode: edit ~/.config/opencode/opencode.json — under "permission", set the tool key to "allow".
+    Current keys: read, edit, glob, grep, list, lsp, todowrite, websearch, webfetch, bash, task,
+    external_directory, codesearch, skill, question.
+HOW
+}
+
 # ── Dispatch ─────────────────────────────────────────────────────────────
-[ $# -eq 0 ] && { echo "work: usage: work {pick-agents|review|state-get|state-set} ..." >&2; exit 2; }
+[ $# -eq 0 ] && { echo "work: usage: work {pick-agents|review|state-get|state-set|clean|permissions} ..." >&2; exit 2; }
 
 sub="$1"; shift
 case "$sub" in
@@ -494,6 +772,7 @@ case "$sub" in
   state-get)   cmd_state_get ;;
   state-set)   cmd_state_set "$@" ;;
   clean)       cmd_clean "$@" ;;
+  permissions) cmd_permissions "$@" ;;
   -h|--help)
     awk '/^[^#]/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
     exit 0 ;;

@@ -110,7 +110,7 @@ When `/work` is waiting for reviewers, Claude is suspended on a Bash tool call. 
 - CPU during wait: **0** (inotify is kernel-level)
 - Latency between reviewer finishing and Claude resuming: **<1s** (filesystem event)
 
-A 15-second safety wakeup also re-checks for permission prompts (auto-approves safe ones, refuses destructive ones).
+A 5-second safety wakeup also re-checks for permission prompts (auto-approves safe ones, refuses destructive ones), modal popups (opencode "Select agent" / "Select model" pickers — auto-dismissed with Escape), and provider errors (Moonshot/DeepSeek 5xx, rate limits — see *Resilience* below).
 
 ## Pre-merge checklist
 
@@ -139,11 +139,44 @@ Common cases:
 - Add a 2nd Gemini: `gem-2` (e.g. for parallel review)
 - Add a Claude reviewer running in tmux: `claude-1` with `type: "claude"` (you'd need to extend `work-pack-build` quorum logic to recognize it)
 
+## Resilience — what happens when a reviewer breaks
+
+Real reviewer failures fall into three classes. `/work` handles each automatically and only escalates to Claude when it can't recover.
+
+| Failure | Detection | Recovery |
+|---|---|---|
+| **Provider error** (Moonshot/DeepSeek 5xx, rate limit, gateway hiccup, "Error from provider", context overflow) | `ERROR_RE` matched in pane within 5s | Auto-retry the nudge once. If a second error fires within 60s: opencode lineage gets a peer-swap (kimi ⇄ deepseek), other lineages get a stub findings file ending `## DONE` so the watcher exits fast and Claude takes over. |
+| **TUI modal popup** (opencode "Select agent" / "Select model" / "Ask: No results found" — triggered by `/` or `@` chars at chunk boundaries during paste) | `OPENCODE_POPUP_RE` matched in pane within 5s | Send `Escape` twice + re-nudge. Popup dismissed silently. Pre-flight `Escape×2` also runs before every opencode nudge. |
+| **Permission prompt for shell command** (CLI prompts the reviewer for `cat`/`tee`/`bash` execution) | `PROMPT_RE` matched in pane | Auto-approve with the right keystrokes (codex `y`, gemini numbered `2`, opencode arrow `Right Enter` for "Allow always"). Logs the command to `approvals.log` so you can later add it to your CLI's permanent allow-list. |
+| **Destructive command** (`rm -rf`, `sudo`, `git push --force`, `DROP TABLE`, ~25 patterns) | `DESTRUCTIVE_RE` matched in pane | **NOT auto-approved.** Agent stays stuck, orchestrator prints `tmux attach -t <session>`, logs to `destructive-blocks.log`. Visible-stuck > silent-rejection. |
+
+**See what's been stuck across runs:**
+```
+work permissions          # last 30 auto-approvals + repeating commands + destructive blocks
+```
+
+This lets you spot bash patterns that prompt repeatedly and add them to your CLI config (e.g. `~/.config/opencode/opencode.json`'s `permission.bash` block) so they're allowed permanently — no orchestrator round-trip.
+
+## Per-CLI prompt format
+
+Each CLI's TUI handles multi-line input differently, so `/work` builds a per-CLI prompt:
+
+| CLI | Format | Why |
+|---|---|---|
+| Codex | Multi-paragraph (bracketed-paste safe) | Codex handles `[Pasted Content N chars]` blocks correctly |
+| Gemini | **Single line** with `@/abs/path/to/pack.xml` (inline file attach) | Gemini's TUI treats every `\n` as Submit — multi-paragraph paste fragments into N separate one-line queries |
+| Opencode (kimi+deepseek) | **Single line**, plain text path (no leading `/` or `@`) | tmux paste-buffer splits into ~1.5KB chunks; `/` or `@` at a chunk boundary opens slash-command or agent-picker mid-paste, swallowing the rest |
+
+## Pack truncation safety
+
+When a review's pack exceeds `MAX_CTX_BYTES` (800KB default — sized for Opus 4.7 / Gemini 3.1 Pro / Kimi K2.6's 1M+ context), `work-pack-build` drops journals → memory files → diff in that order. When the diff itself gets truncated, the pack emits an explicit `<reviewer-instruction priority="critical">` block ordering the reviewer to verify each finding against the full `<code_file>` blocks before reporting. This prevents the failure mode where reviewers anchor on the truncated diff and hallucinate findings about the cut-off portion.
+
 ## Customization
 
 - **Quorum rule**: edit `quorum_check()` in `work-converge`
-- **Pack context**: edit `find_arch_docs()`, `discover_memory_files()`, `discover_journals()` in `work-pack-build`
-- **Permission patterns**: edit `PROMPT_RE` and `DESTRUCTIVE_RE` in `work`
+- **Pack context + cap**: `MAX_CTX_BYTES` (default 800KB) and discovery functions in `work-pack-build`
+- **Permission patterns**: `PROMPT_RE` (auto-approve), `DESTRUCTIVE_RE` (block), `ERROR_RE` (retry), `OPENCODE_POPUP_RE` (dismiss) in `work`
+- **Opencode peer-swap**: `OPENCODE_PARTNER` map in `work` (default `kimi ⇄ deepseek`)
 - **Modes**: edit `~/.claude/commands/work.md` for the slash command behavior
 
 ## Safety
@@ -157,12 +190,22 @@ Common cases:
 
 **Reviewer hangs forever**
 - Check the findings file: did it end with `## DONE`?
-- Check the tmux pane: is the reviewer stuck on a permission prompt?
-- Check `work` runtime guard logs (stderr) — did it auto-approve, or refuse?
+- Check the tmux pane: is the reviewer stuck on a permission prompt, modal popup, or "Error from provider" toast?
+- Check the per-run log dir (`/tmp/work-<task>-r<n>-<ts>/`):
+  - `error-retries.log` — provider errors + retries + peer-swaps + escalations
+  - `popup-dismissals.log` — opencode modal popups dismissed
+  - `approvals.log` — bash permission prompts auto-approved (and the command line)
+  - `destructive-blocks.log` — destructive commands refused (agent stuck on purpose)
+- Run `work permissions` for an aggregate view across all recent runs.
 
 **Quorum never passes**
 - Check `agents.json` — at least one alive agent per lineage?
 - Check `agent-status` — any agent rate-limited?
+- Check the per-run log dir for an `<agent>-findings.md` containing `⚠️ AGENT ESCALATED TO CLAUDE` — that means the orchestrator gave up after retries/swaps; Claude should pick the next step from the 3 numbered options in the stub.
+
+**Reviewer reports findings about code that isn't in the diff**
+- Likely cause: pack hit the diff truncation cap. Check `pack-meta.json` for `diff_bytes`. If it equals `50026`, truncation fired and the reviewer should have seen a `<reviewer-instruction priority="critical">` warning telling them to cross-check `<code_file>` blocks. If they hallucinated anyway, file an issue — that reviewer model isn't following the instruction.
+- Workaround: bump `MAX_CTX_BYTES` higher in `work-pack-build` (default 800KB; reviewers have 1M+ context).
 
 **Wrong file paths**
 - Make sure `~/.local/bin` is in your `PATH`
