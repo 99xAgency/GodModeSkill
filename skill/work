@@ -773,103 +773,154 @@ cmd_status() {
     esac
   done
 
-  local run_dir
+  local run_dir=""
   if [ -n "$explicit_run" ]; then
     run_dir="$explicit_run"
   else
     run_dir=$(ls -dt /tmp/work-*-r*-* 2>/dev/null | head -1 || true)
   fi
-  [ -z "$run_dir" ] || [ ! -d "$run_dir" ] && {
-    echo "work status: no /work runs found in /tmp/work-*-r*-*" >&2
-    return 1
+  # If no run found, fleet view still renders (just no per-run columns).
+
+  # Compute the colored state string for one agent given pane text + optional
+  # findings-file context. Echoes the ANSI-coded state as one line.
+  _state_for() {
+    local pane="$1"
+    local in_run="$2"   # 1 if agent is in current run (has findings file), 0 otherwise
+    local done_marker="$3" # ✓ or ✗
+    local bytes="$4"
+    local elapsed_s="$5"
+    local sess_alive="$6"  # 1 if tmux has-session, 0 otherwise
+
+    if [ "$sess_alive" = "0" ]; then
+      printf '\033[1;31mDEAD\033[0m (no tmux session)'
+      return
+    fi
+    if [ "$in_run" = "1" ] && [ "$done_marker" = "✓" ]; then
+      printf '\033[1;32mDONE\033[0m'
+      return
+    fi
+    if echo "$pane" | grep -qiE 'Error from provider|Provider returned error|rate limit|429 Too Many|503 Service|context (length|window) exceeded'; then
+      printf '\033[1;31mERRORED\033[0m'
+      return
+    fi
+    if echo "$pane" | grep -qE 'Select agent|Select model|Select session|^[[:space:]]*Ask[[:space:]]+No results found'; then
+      printf '\033[1;33mPOPUP-STUCK\033[0m'
+      return
+    fi
+    if echo "$pane" | grep -qiE 'Allow this|Allow execution|Allow once|Approve this|\(y/N\)|\[y/N\]'; then
+      printf '\033[1;33mPERM-PROMPT\033[0m'
+      return
+    fi
+    if echo "$pane" | grep -qE 'esc[ ]+(to[ ]+)?(interrupt|cancel)|Working|Thinking|Generating|Streaming|Processing|Reading|Writing|Sending|Receiving|⬝|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|↑↓|interrupt'; then
+      printf '\033[1;34mWORKING\033[0m'
+      return
+    fi
+    if [ "$in_run" = "1" ] && [ "$bytes" -gt 200 ]; then
+      printf '\033[1;34mWRITING\033[0m'
+      return
+    fi
+    if [ "$in_run" = "1" ] && [ "$elapsed_s" -lt 15 ]; then
+      printf '\033[1;34mWORKING\033[0m (just nudged)'
+      return
+    fi
+    if [ "$in_run" = "1" ]; then
+      printf '\033[2midle?\033[0m (in run but silent)'
+    else
+      printf '\033[2midle\033[0m'
+    fi
+  }
+
+  _format_elapsed() {
+    local s="$1"
+    if [ "$s" -lt 60 ]; then echo "${s}s"
+    elif [ "$s" -lt 3600 ]; then echo "$((s/60))m$((s%60))s"
+    else echo "$((s/3600))h$((s/60%60))m"
+    fi
   }
 
   _render_status() {
     local rd="$1"
-    local now_iso
+    local now_iso now
     now_iso=$(date '+%Y-%m-%d %H:%M:%S')
-    printf '\033[1;36m▶ %s\033[0m  (refresh: %s)\n\n' "$(basename "$rd")" "$now_iso"
+    now=$(date +%s)
 
-    # Discover agents = files matching <name>-findings.md
-    local findings_files
-    mapfile -t findings_files < <(ls "$rd"/*-findings.md 2>/dev/null)
-    [ ${#findings_files[@]} -eq 0 ] && { echo "  (no findings files yet)"; return; }
+    if [ -n "$rd" ] && [ -d "$rd" ]; then
+      printf '\033[1;36m▶ %s\033[0m  (refresh: %s)\n\n' "$(basename "$rd")" "$now_iso"
+    else
+      printf '\033[1;36m▶ Fleet status\033[0m  (refresh: %s)  — no recent run\n\n' "$now_iso"
+    fi
 
     # Header
     printf '  %-12s %-10s %-9s %-6s %-9s %s\n' \
       "AGENT" "TMUX" "ELAPSED" "DONE?" "BYTES" "STATE"
     printf '  %s\n' "------------ ---------- --------- ----- --------- -----"
 
-    local f name session=""
-    for f in "${findings_files[@]}"; do
-      name=$(basename "$f" -findings.md)
-      session=$(jq -r --arg n "$name" '.agents[] | select(.name == $n) | .tmux_session // ""' "$AGENTS_JSON" 2>/dev/null)
-      session="${session:-?}"
+    # Iterate over ALL agents from agents.json, in priority order.
+    # Agents in the current run get full file-derived info; agents not in
+    # the run still get a pane-state summary so the user sees the whole fleet.
+    local all_agents
+    # Sort: type alphabetically (codex → gemini → opencode), then name.
+    # Lets the display group lineages together.
+    mapfile -t all_agents < <(jq -r '.agents[] | "\(.type)\t\(.name)\t\(.tmux_session)"' "$AGENTS_JSON" | sort -t$'\t' -k1,1 -k2,2)
 
-      # Elapsed since file creation (proxy for nudge time)
-      local mtime now elapsed_s elapsed_str
-      mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-      now=$(date +%s)
-      elapsed_s=$((now - mtime))
-      if [ "$elapsed_s" -lt 60 ]; then elapsed_str="${elapsed_s}s"
-      elif [ "$elapsed_s" -lt 3600 ]; then elapsed_str="$((elapsed_s/60))m$((elapsed_s%60))s"
-      else elapsed_str="$((elapsed_s/3600))h$((elapsed_s/60%60))m"
-      fi
+    local row name session
+    local f mtime elapsed_s elapsed_str done_str bytes pane in_run sess_alive state
+    for row in "${all_agents[@]}"; do
+      # Format is now: type \t name \t session
+      name=$(echo "$row" | cut -f2)
+      session=$(echo "$row" | cut -f3)
+      [ -z "$name" ] && continue
 
-      # DONE marker?
-      local done_str="✗"
-      if tail -3 "$f" 2>/dev/null | grep -qE '^## DONE\s*$'; then
-        done_str="✓"
-      fi
-
-      # File size
-      local bytes
-      bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
-
-      # Pane state. Detection layers, in order:
-      #   1. DONE marker is in the file              → DONE
-      #   2. Pane shows provider error               → ERRORED
-      #   3. Pane shows opencode modal popup         → POPUP-STUCK
-      #   4. Pane shows permission prompt            → PERM-PROMPT
-      #   5. Pane shows known WORKING signal         → WORKING
-      #      • opencode: "esc interrupt" + animated dots
-      #      • codex/gemini: "Working" / "Thinking" / "Generating" / "esc"
-      #      • braille spinners ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ used by every modern CLI
-      #   6. File has grown past the stub (~120 B)   → WRITING (silent)
-      #   7. Elapsed < 15s since nudge               → WORKING (just nudged)
-      #   8. Fallthrough                             → idle?  (truly stuck)
-      local state pane=""
-      pane=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -30 || true)
-      if [ "$done_str" = "✓" ]; then
-        state="\033[1;32mDONE\033[0m"
-      elif echo "$pane" | grep -qiE 'Error from provider|Provider returned error|rate limit|429 Too Many|503 Service|context (length|window) exceeded'; then
-        state="\033[1;31mERRORED\033[0m"
-      elif echo "$pane" | grep -qE 'Select agent|Select model|Select session|^[[:space:]]*Ask[[:space:]]+No results found'; then
-        state="\033[1;33mPOPUP-STUCK\033[0m"
-      elif echo "$pane" | grep -qiE 'Allow this|Allow execution|Allow once|Approve this|\(y/N\)|\[y/N\]'; then
-        state="\033[1;33mPERM-PROMPT\033[0m"
-      elif echo "$pane" | grep -qE 'esc[ ]+(to[ ]+)?(interrupt|cancel)|Working|Thinking|Generating|Streaming|Processing|Reading|Writing|Sending|Receiving|⬝|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|↑↓|interrupt'; then
-        state="\033[1;34mWORKING\033[0m"
-      elif [ "$bytes" -gt 200 ]; then
-        state="\033[1;34mWRITING\033[0m"
-      elif [ "$elapsed_s" -lt 15 ]; then
-        state="\033[1;34mWORKING\033[0m (just nudged)"
+      # tmux session alive?
+      if tmux has-session -t "$session" 2>/dev/null; then
+        sess_alive=1
+        pane=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -30 || true)
       else
-        state="\033[2midle?\033[0m"
+        sess_alive=0
+        pane=""
       fi
 
-      printf "  %-12s %-10s %-9s %-6s %-9s ${state}\n" \
-        "$name" "$session" "$elapsed_str" "$done_str" "$bytes"
+      # In current run?
+      elapsed_s=0
+      f="$rd/${name}-findings.md"
+      if [ -n "$rd" ] && [ -f "$f" ]; then
+        in_run=1
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+        elapsed_s=$((now - mtime))
+        elapsed_str=$(_format_elapsed "$elapsed_s")
+        bytes=$(stat -c %s "$f" 2>/dev/null || echo 0)
+        if tail -3 "$f" 2>/dev/null | grep -qE '^## DONE\s*$'; then
+          done_str="✓"
+        else
+          done_str="✗"
+        fi
+      else
+        in_run=0
+        elapsed_str="-"
+        bytes=0
+        done_str="-"
+      fi
+
+      state=$(_state_for "$pane" "$in_run" "$done_str" "$bytes" "$elapsed_s" "$sess_alive")
+
+      # Display: bytes column uses '-' instead of 0 when not in run
+      local bytes_col="$bytes"
+      [ "$in_run" = "0" ] && bytes_col="-"
+
+      printf "  %-12s %-10s %-9s %-6s %-9s %b\n" \
+        "$name" "$session" "$elapsed_str" "$done_str" "$bytes_col" "$state"
     done
 
-    # Side-channel logs
-    echo ""
-    local n_err n_pop n_dest n_appr
-    n_err=$([ -f "$rd/error-retries.log" ] && wc -l < "$rd/error-retries.log" | tr -d ' ' || echo 0)
-    n_pop=$([ -f "$rd/popup-dismissals.log" ] && wc -l < "$rd/popup-dismissals.log" | tr -d ' ' || echo 0)
-    n_dest=$([ -f "$rd/destructive-blocks.log" ] && wc -l < "$rd/destructive-blocks.log" | tr -d ' ' || echo 0)
-    n_appr=$([ -f "$rd/approvals.log" ] && wc -l < "$rd/approvals.log" | tr -d ' ' || echo 0)
-    printf '  Logs:  errors=%s  popups=%s  blocks=%s  approvals=%s\n' "$n_err" "$n_pop" "$n_dest" "$n_appr"
+    # Side-channel logs (only if there's a current run)
+    if [ -n "$rd" ] && [ -d "$rd" ]; then
+      echo ""
+      local n_err n_pop n_dest n_appr
+      n_err=$([ -f "$rd/error-retries.log" ] && wc -l < "$rd/error-retries.log" | tr -d ' ' || echo 0)
+      n_pop=$([ -f "$rd/popup-dismissals.log" ] && wc -l < "$rd/popup-dismissals.log" | tr -d ' ' || echo 0)
+      n_dest=$([ -f "$rd/destructive-blocks.log" ] && wc -l < "$rd/destructive-blocks.log" | tr -d ' ' || echo 0)
+      n_appr=$([ -f "$rd/approvals.log" ] && wc -l < "$rd/approvals.log" | tr -d ' ' || echo 0)
+      printf '  Logs:  errors=%s  popups=%s  blocks=%s  approvals=%s\n' "$n_err" "$n_pop" "$n_dest" "$n_appr"
+    fi
   }
 
   if [ "$watch" -eq 1 ]; then
