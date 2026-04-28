@@ -53,6 +53,33 @@
       "working_dir": "$HOME"
     },
     {
+      "_comment": "Optional second Gemini account. Gemini CLI hardcodes ~/.gemini/ — isolate via HOME override pointing at a fake home that contains its own .gemini/ subdir. Setup: mkdir -p $HOME/.gemini-home-gem-2/.gemini && cp $HOME/.gemini/{settings.json,GEMINI.md} $HOME/.gemini-home-gem-2/.gemini/ && cp -r $HOME/.gemini/policies $HOME/.gemini-home-gem-2/.gemini/ — then launch and complete OAuth with the second Google account.",
+      "name": "gem-2",
+      "tmux_session": "gem-2",
+      "type": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "auth": "subscription",
+      "auth_provider": "Google AI",
+      "quota_group": "google-ai-acct-2",
+      "balance_endpoint": null,
+      "rate_limits": {
+        "weekly": {
+          "description": "daily reset (Pro 1500 req/day; Flash 5K)",
+          "next_reset": null
+        },
+        "short": {
+          "description": "n/a — Gemini CLI uses daily quota",
+          "next_reset": null
+        }
+      },
+      "notes": "Gemini CLI on second Google AI Pro account. HOME override at launch isolates ~/.gemini/. Run /stats inside TUI for live quota.",
+      "gemini_home": "$HOME/.gemini-home-gem-2",
+      "nudge_command": "$HOME/dev/codex-bridge/nudge-gem",
+      "tmux_env_var": "GEM_TMUX_SESSION",
+      "launch_command": "HOME=$HOME/.gemini-home-gem-2 gemini --approval-mode auto_edit --model gemini-3.1-pro-preview",
+      "working_dir": "$HOME"
+    },
+    {
       "name": "kimi",
       "tmux_session": "kimi",
       "type": "opencode",
