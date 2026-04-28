@@ -777,13 +777,39 @@ cmd_status() {
     esac
   done
 
-  local run_dir=""
+  # Collect candidate run dirs. With --run, single dir. Without, find ALL
+  # runs with files modified in the last 10 min — common to have 2 parallel
+  # /work reviews in flight (e.g. orchestrator running a re-review while the
+  # original is still finishing). One-dir-only used to hide the other run.
+  local run_dirs=()
   if [ -n "$explicit_run" ]; then
-    run_dir="$explicit_run"
+    run_dirs=("$explicit_run")
   else
-    run_dir=$(ls -dt /tmp/work-*-r*-* 2>/dev/null | head -1 || true)
+    local d newest_file_age now
+    now=$(date +%s)
+    while IFS= read -r d; do
+      [ -d "$d" ] || continue
+      # Skip dirs with no findings files — those are pack-build smoke-tests
+      # or aborted runs, not real reviews.
+      compgen -G "$d/*-findings.md" >/dev/null || continue
+      # Get mtime of the newest findings file (the signal we actually care
+      # about — pack.xml mtime is created-once and stale).
+      newest_file_age=$(find "$d" -maxdepth 1 -name "*-findings.md" -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+      [ -z "$newest_file_age" ] && continue
+      # Active = newest findings modified within the last 10 minutes
+      if [ "$((now - ${newest_file_age%.*}))" -lt 600 ]; then
+        run_dirs+=("$d")
+      fi
+    done < <(ls -dt /tmp/work-*-r*-* 2>/dev/null | head -10)
+    # Cap at 3 most-recent active runs to keep output readable
+    run_dirs=("${run_dirs[@]:0:3}")
+    # If nothing active, fall back to most-recent run (so user still sees something)
+    if [ ${#run_dirs[@]} -eq 0 ]; then
+      local fallback
+      fallback=$(ls -dt /tmp/work-*-r*-* 2>/dev/null | head -1 || true)
+      [ -n "$fallback" ] && run_dirs=("$fallback")
+    fi
   fi
-  # If no run found, fleet view still renders (just no per-run columns).
 
   # Compute the colored state string for one agent given pane text + optional
   # findings-file context. Echoes the ANSI-coded state as one line.
@@ -927,14 +953,31 @@ cmd_status() {
     fi
   }
 
+  _render_all() {
+    if [ ${#run_dirs[@]} -eq 0 ]; then
+      _render_status ""
+      return
+    fi
+    local i=0
+    for d in "${run_dirs[@]}"; do
+      [ "$i" -gt 0 ] && echo ""
+      _render_status "$d"
+      i=$((i+1))
+    done
+    if [ ${#run_dirs[@]} -gt 1 ]; then
+      echo ""
+      printf '\033[2m  (%d active runs shown — pass --run <dir> to focus on one)\033[0m\n' ${#run_dirs[@]}
+    fi
+  }
+
   if [ "$watch" -eq 1 ]; then
     while :; do
       clear
-      _render_status "$run_dir"
+      _render_all
       sleep 2
     done
   else
-    _render_status "$run_dir"
+    _render_all
   fi
 }
 
