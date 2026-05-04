@@ -6,8 +6,8 @@
 # The slug is derived from basename(pwd) or the WORK_PROJECT_SLUG env var.
 #
 # Usage:
-#   work-fleet-restart              # restart kimi, deepseek (scoped to pwd)
-#   work-fleet-restart --all        # also restart cdx-1
+#   work-fleet-restart              # restart non-codex agents (from agents.json)
+#   work-fleet-restart --all        # also restart cdx-* agents
 #   work-fleet-restart kimi         # restart only the named session(s)
 #   work-fleet-restart --dry-run    # show what would happen
 #
@@ -16,6 +16,8 @@
 # and inspect each session's pane first.
 
 set -euo pipefail
+
+AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
 
 DRY_RUN=0
 TARGETS=()
@@ -32,10 +34,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Default targets if none specified
+# Default targets: derive from agents.json if no explicit list given.
+# --all includes codex agents; without it, only non-codex are restarted
+# (codex accounts have expensive auth state you don't want to lose casually).
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  TARGETS=(kimi deepseek)
-  [ "$INCLUDE_CDX" -eq 1 ] && TARGETS=(cdx-1 kimi deepseek)
+  if [ "$INCLUDE_CDX" -eq 1 ]; then
+    mapfile -t TARGETS < <(jq -r '.agents[] | select(.disabled != true) | .name' "$AGENTS_JSON")
+  else
+    mapfile -t TARGETS < <(jq -r '.agents[] | select(.disabled != true) | select(.type != "codex") | .name' "$AGENTS_JSON")
+  fi
 fi
 
 # Project slug — derived from cwd, overridable via env var
@@ -44,19 +51,27 @@ PROJECT_DIR="$(pwd)"
 
 # Launch command for each session — single source of truth.
 # All agents work in $PROJECT_DIR (the cwd when this script was invoked).
+# Reads launch_command + working_dir from agents.json; falls back to
+# hardcoded cases for backwards compatibility.
 launch_for() {
-  case "$1" in
-    cdx-1)
-      echo "bash -lc 'cd $PROJECT_DIR ; CODEX_HOME=$HOME/.codex codex ; exec bash'" ;;
-    kimi)
-      echo "bash -lc 'cd $PROJECT_DIR ; $HOME/.opencode/bin/opencode -m openrouter/moonshotai/kimi-k2.6 ; echo \"--- exited \$? ---\" ; exec bash'" ;;
-    claude-sonnet)
-      echo "bash -lc 'cd $PROJECT_DIR ; claude --model sonnet --dangerously-skip-permissions ; echo \"--- exited \$? ---\" ; exec bash'" ;;
-    deepseek)
-      echo "bash -lc 'cd $PROJECT_DIR ; $HOME/.opencode/bin/opencode -m openrouter/deepseek/deepseek-v4-pro ; echo \"--- exited \$? ---\" ; exec bash'" ;;
-    *)
-      echo ""; return 1 ;;
-  esac
+  local name="$1"
+  local row
+  row=$(jq -c --arg n "$name" '.agents[] | select(.name == $n)' "$AGENTS_JSON" 2>/dev/null)
+  if [ -n "$row" ]; then
+    local launch_cmd working_dir
+    launch_cmd=$(jq -r '.launch_command // empty' <<<"$row")
+    working_dir=$(jq -r '.working_dir // empty' <<<"$row")
+    # Expand $HOME in values from JSON
+    launch_cmd="${launch_cmd//\$HOME/$HOME}"
+    working_dir="${working_dir//\$HOME/$HOME}"
+    # Default working dir to project dir
+    [ -z "$working_dir" ] || [ "$working_dir" = "\$HOME" ] || [ "$working_dir" = "$HOME" ] && working_dir="$PROJECT_DIR"
+    if [ -n "$launch_cmd" ]; then
+      echo "bash -lc 'cd $working_dir ; $launch_cmd ; echo \"--- exited \$? ---\" ; exec bash'"
+      return 0
+    fi
+  fi
+  echo ""; return 1
 }
 
 echo "▶ Project: $WORK_PROJECT_SLUG  (dir: $PROJECT_DIR)"
@@ -67,7 +82,7 @@ echo
 for agent in "${TARGETS[@]}"; do
   tmux_sess="${agent}-${WORK_PROJECT_SLUG}"
   cmd=$(launch_for "$agent") || {
-    echo "  ✗ $agent — unknown agent name, skipping"
+    echo "  ✗ $agent — no launch_command in agents.json, skipping"
     continue
   }
 

@@ -2,6 +2,8 @@
 
 Place this file at the working dir of each opencode session (e.g. `~/dev/kimi-session/AGENTS.md`, `~/dev/deepseek-session/AGENTS.md`).
 
+> **Note:** Claude Code agents don't need this file — they use their own `CLAUDE.md` for project context and have native Write tool support (no shell permission issues).
+
 You are a **code reviewer** invoked by the `/work` orchestrator. Your job is to read the XML pack at the path provided and write findings to the path provided.
 
 ## Hard rules — read before responding

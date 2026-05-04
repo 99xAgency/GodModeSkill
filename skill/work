@@ -438,8 +438,14 @@ PYEOF
   done
 
   # ── Wait for ALL findings files to end with `## DONE` ──────────────────
-  # Strategy: poll every 5s. Hard cap: $timeout seconds.
-  echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE'" >&2
+  # Strategy: inotifywait if available (zero-CPU event-driven), else 5s poll.
+  local use_inotify=0
+  command -v inotifywait >/dev/null && use_inotify=1
+  if [ "$use_inotify" -eq 1 ]; then
+    echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE' (event-driven via inotifywait)" >&2
+  else
+    echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE' (polling every 5s)" >&2
+  fi
 
   local start now elapsed
   start=$(date +%s)
@@ -470,9 +476,13 @@ PYEOF
       check_for_errors "$name" >&2
     done
 
-    # Poll every 5s to re-check permission prompts AND provider errors —
-    # catches stuck-on-prompt or errored reviewers fast.
-    sleep 5
+    # Wait for filesystem change (inotifywait) or poll. 5s wakeup re-checks
+    # permission prompts AND provider errors — catches stuck agents fast.
+    if [ "$use_inotify" -eq 1 ]; then
+      inotifywait -qq -e modify -e create "$out/" --timeout 5 2>/dev/null || true
+    else
+      sleep 5
+    fi
   done
 
   echo "  ✓ All ${done_count}/${#VALID[@]} reviewers done in ${elapsed}s" >&2

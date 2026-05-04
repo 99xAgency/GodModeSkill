@@ -9,11 +9,11 @@ Multi-LLM agents running side-by-side in tmux, driven by the `/work` Claude Code
 For real workflows (planning a feature, implementing, fixing major bugs), use the **`/work`** slash command in Claude Code.
 
 `/work` handles:
-- Lineage-weighted quorum (1 codex + 1 gemini + 1 opencode must all agree)
+- Lineage-weighted quorum (1 per enabled lineage must agree)
 - LRU rotation across all agents in `agents.json` (extra agents auto-eligible when added)
 - Auto `/clear` between different PRs (preserves context within same task)
 - XML packs with auto-discovered context (architecture docs, memory, journals)
-- Event-driven wait via `inotifywait` (zero token burn while reviewers think)
+- Event-driven wait via `inotifywait` on Linux, 5s poll on macOS (zero token burn while reviewers think)
 - Disagreement loop with `--prior-rounds-file` (max 3 rounds)
 - Auto git ops (branch, commit, push, PR) — but ALWAYS asks before merge
 
@@ -30,13 +30,14 @@ Plan-priced (subscription-based) reviewers are picked first. Pay-per-token revie
 | Primary  | cdx-* (Codex) | Plan-priced via ChatGPT subscription, top-tier code reasoning |
 | Primary  | gem-* (Gemini) | Plan-priced via Google AI Pro, best second opinion vs Codex |
 | Primary  | kimi, deepseek (via OpenCode Go) | Plan-priced via OpenCode Go subscription |
+| Primary  | claude-sonnet (Claude Code CLI) | Plan-priced via Anthropic Max subscription |
 | Fallback | kimi, deepseek (via direct API key) | Pay-per-token, only if Go plan unavailable |
 
 ---
 
 ## Golden rule for second opinions
 
-**Always pick a DIFFERENT model lineage.** Two Codex sessions = same model = same blind spots. The whole point of multi-reviewer fan-out is reviewer-lineage diversity. `/work` enforces this automatically via `work pick-agents` (1 codex + 1 gemini + 1 opencode).
+**Always pick a DIFFERENT model lineage.** Two Codex sessions = same model = same blind spots. The whole point of multi-reviewer fan-out is reviewer-lineage diversity. `/work` enforces this automatically via `work pick-agents` (1 per enabled lineage, detected from `agents.json`).
 
 ---
 

@@ -7,13 +7,13 @@ Reads each <agent>-findings.md from <out-dir>, extracts the <findings> block
 and decides whether quorum is reached.
 
 Quorum rule (lineage-weighted):
-  agree if >=1 agent of each ENABLED lineage returned <verdict agree="true">.
+  agree if ≥1 agent of each ENABLED lineage returned <verdict agree="true">.
   Partial verdicts count as agree only if reasoning explicitly says minor-only.
 
 Exit codes:
-  0  -> quorum reached, proceed
-  1  -> quorum NOT reached (revise + retry recommended)
-  2  -> too many missing/dead reviewers to decide (escalate to user)
+  0  → quorum reached, proceed
+  1  → quorum NOT reached (revise + retry recommended)
+  2  → too many missing/dead reviewers to decide (escalate to user)
 
 Output: JSON to stdout with full breakdown.
 """
@@ -27,7 +27,7 @@ from xml.etree import ElementTree as ET
 
 
 def load_agent_types(agents_json: Path) -> dict[str, str]:
-    """name -> type from agents.json."""
+    """name → type from agents.json."""
     data = json.loads(agents_json.read_text())
     return {a["name"]: a["type"] for a in data["agents"]}
 
@@ -147,9 +147,9 @@ def extract_response(text: str) -> dict:
 def quorum_check(per_agent: dict, agent_types: dict[str, str], disabled: set[str] | None = None) -> dict:
     """
     Lineage-weighted quorum:
-      need >=1 agent of each ENABLED lineage to return verdict=true.
+      need ≥1 agent of each ENABLED lineage to return verdict=true.
       Lineages with all agents disabled are marked "disabled" and don't
-      block the decision (degraded quorum -- user has explicitly opted out).
+      block the decision (degraded quorum — user has explicitly opted out).
       verdict=partial counts as agree IFF the reviewer's findings list has no
       severity in {critical, high} (i.e. only nits).
     """
@@ -188,7 +188,7 @@ def quorum_check(per_agent: dict, agent_types: dict[str, str], disabled: set[str
             lineage_status[lin] = "disagree"
 
     # Decision: disabled lineages don't block. Missing (active but no response)
-    # -> incomplete. Disagree -> revise + retry.
+    # → incomplete. Disagree → revise + retry.
     missing = [l for l, s in lineage_status.items() if s == "missing"]
     disagree = [l for l, s in lineage_status.items() if s == "disagree"]
     disabled_seen = [l for l, s in lineage_status.items() if s == "disabled"]
@@ -232,7 +232,7 @@ def main():
 
     # Self-consistency check: verify each finding's <quoted-line> appears in
     # the cited file. Findings whose quote can't be located are marked
-    # `verified: false` -- likely hallucinations from over-eager review.
+    # `verified: false` — likely hallucinations from over-eager review.
     # Repo root is best-effort: walk up from out_dir to find a .git dir, else cwd.
     def _find_repo_root(start: Path) -> Path:
         p = Path.cwd()
@@ -276,7 +276,7 @@ def main():
 
     quorum = quorum_check(per_agent, agent_types, disabled_lineages(Path(args.agents_json)))
 
-    # Aggregate finding stats -- distinguishes verified vs unverified
+    # Aggregate finding stats — distinguishes verified vs unverified
     all_findings = []
     for name, resp in per_agent.items():
         for f in resp["findings"]:

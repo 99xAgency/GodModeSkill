@@ -2,7 +2,7 @@
 
 > **`/work`** — a single Claude Code command that runs every plan, feature, and bugfix past **3 different model families** before any merge.
 
-Codex + Gemini + OpenCode (Kimi/DeepSeek) review your work in parallel. Quorum must agree, or Claude revises and retries. Zero token-burn while waiting. Auto-handles git. Always asks before merge.
+Codex + Gemini + OpenCode (Kimi/DeepSeek) + optionally Claude Code review your work in parallel. Quorum must agree, or Claude revises and retries. Zero token-burn while waiting. Auto-handles git. Always asks before merge.
 
 ---
 
@@ -62,8 +62,9 @@ You need at least **3 different model families**:
 - 🟢 **OpenCode CLI** — one of:
   - OpenCode Go subscription (gives Kimi + DeepSeek + others, flat-fee) ← **recommended**
   - Direct API keys (Moonshot, DeepSeek)
+- 🟣 **Claude Code CLI** *(optional)* — Anthropic Max subscription. Runs as a headless reviewer via `--dangerously-skip-permissions`. Adds a 4th lineage for stronger quorum diversity.
 
-System tools: `tmux`, `jq`, `inotify-tools`, `git`, `python3`.
+System tools: `tmux`, `jq`, `git`, `python3`. On Linux: `inotify-tools` (event-driven wait). On macOS: `coreutils`, `findutils` via Homebrew (polling used instead of inotifywait).
 
 > ⚠️ Only have 2 families? The lineage quorum will fail (you need 1 of each: codex + gemini + opencode). You can edit `work-converge` to relax the rule, but you lose the diversity insight.
 
@@ -86,13 +87,16 @@ If you use API keys for Kimi/DeepSeek instead of OpenCode Go, expect **~cents pe
 | 🟠 codex | `cdx-*` |
 | 🔵 gemini | `gem-*` |
 | 🟢 opencode | `kimi`, `deepseek`, … |
+| 🟣 claude | `claude-sonnet`, … |
 
-✅ **Quorum passes** only when **at least one agent of each lineage** returns `agree`.
+Lineages are detected dynamically from `agents.json`. Only lineages with at least one enabled agent participate in quorum. Set `"disabled": true` on agents you don't have — their lineage is excluded automatically.
+
+✅ **Quorum passes** only when **at least one agent of each enabled lineage** returns `agree`.
 🟡 Partial verdicts count as agree only if no critical/high findings.
 
 | Outcome | Exit | Meaning |
 |---------|------|---------|
-| 🟢 all 3 agree | `0` | merge gate opens |
+| 🟢 all lineages agree | `0` | merge gate opens |
 | 🔴 any disagree | `1` | revise + retry |
 | ⚪ lineage missing | `2` | escalate to user |
 
@@ -100,15 +104,16 @@ If you use API keys for Kimi/DeepSeek instead of OpenCode Go, expect **~cents pe
 
 ## ⚡ How the wait is zero-token
 
-When `/work` is waiting for reviewers, Claude is suspended on a **single Bash tool call** running `inotifywait`:
+When `/work` is waiting for reviewers, Claude is suspended on a **single Bash tool call**:
 
-| Metric | Value |
-|--------|-------|
-| 🪙 Claude tokens during wait | **0** |
-| 🔋 CPU during wait | **0** (kernel inotify) |
-| ⏱️ Resume latency | **<1 s** (filesystem event) |
+| Platform | Strategy | CPU during wait | Resume latency |
+|----------|----------|-----------------|----------------|
+| 🐧 Linux (with `inotifywait`) | kernel inotify | **0** | **<1 s** |
+| 🍎 macOS (no inotifywait) | 5s poll loop | **~0** | **≤5 s** |
 
-A **5-second safety wakeup** also re-checks for permission prompts, modal popups, and provider errors — see *Resilience* below.
+🪙 **Claude tokens during wait: 0** — either way, Claude is blocked in Bash.
+
+A **5-second safety wakeup** (or each poll cycle) re-checks for permission prompts, modal popups, and provider errors — see *Resilience* below.
 
 ---
 
@@ -150,6 +155,7 @@ Catches a lot of "I think it's done" moments where the model has quietly drifted
 | 🟠 Codex | `cdx-1 → cdx-2 → cdx-3` (or however many you have) | One ChatGPT account hits its 5h/weekly limit |
 | 🔵 Gemini | `gem-1 → gem-2 → …` | First Google AI account hits daily quota |
 | 🟢 Opencode | `kimi ⇄ deepseek` | OpenCode Go gateway hiccup on one provider |
+| 🟣 Claude | `claude-sonnet → claude-opus → …` | Anthropic rate limit on one model tier |
 
 `try_lineage_swap` finds any alive agent of the same `type` in `agents.json` not already in the run, copies the prompt over, /clears the partner, nudges. Stays on subscription pricing — picks from agents you've already configured.
 
@@ -176,6 +182,7 @@ Each CLI's TUI handles multi-line input differently, so `/work` builds a **per-C
 | 🟠 Codex | Multi-paragraph (bracketed-paste safe) | Handles `[Pasted Content N chars]` blocks correctly |
 | 🔵 Gemini | **Single line** with `@/abs/path/to/pack.xml` (inline file attach) | Every `\n` is Submit — multi-paragraph paste fragments into N separate queries |
 | 🟢 Opencode | **Single line**, plain-text path (no leading `/` or `@`) | tmux splits paste at ~1.5 KB chunks; `/` or `@` at a chunk boundary opens slash-command or agent-picker mid-paste |
+| 🟣 Claude Code | Multi-paragraph, uses native Write tool | `--dangerously-skip-permissions` means no modals; Write tool avoids shell permission prompts |
 
 ---
 
@@ -268,7 +275,7 @@ Make all `skill/work*` files executable: `chmod +x ~/.local/bin/work*`
 | Destructive block list | `DESTRUCTIVE_RE` in `work` |
 | Provider-error patterns | `ERROR_RE` in `work` |
 | Opencode popup patterns | `OPENCODE_POPUP_RE` in `work` |
-| Opencode peer-swap map | `OPENCODE_PARTNER` in `work` (default `kimi ⇄ deepseek`) |
+| Peer-swap logic | `try_lineage_swap` in `work` (auto-finds same-lineage partner from `agents.json`) |
 | Mode workflows | `~/.claude/commands/work.md` |
 
 ---
@@ -279,7 +286,7 @@ Edit `~/.config/agent-sessions/agents.json`. New entries are auto-included in th
 
 - 4th Codex on a new ChatGPT account → `cdx-4` with its own `CODEX_HOME`
 - 2nd Gemini → `gem-2` (parallel review)
-- Claude reviewer in tmux → `claude-1` with `type: "claude"` (extend `work-converge` quorum logic)
+- Claude Opus reviewer → `claude-opus` with `type: "claude"` and `claude --model opus --dangerously-skip-permissions`
 
 ---
 
@@ -346,7 +353,7 @@ MIT — do whatever you want.
 
 PRs welcome. Especially:
 
-- Support for more CLI types (Claude Code as a reviewer, Ollama agents, …)
+- Support for more CLI types (Ollama agents, …)
 - Better permission-prompt regex patterns for new CLI versions
 - Smarter context discovery in `work-pack-build`
 

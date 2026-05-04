@@ -1,5 +1,5 @@
 ---
-description: Multi-LLM workflow orchestrator with lineage-weighted quorum. Routes to plan / implement / major-bug / minor-bug modes. Builds XML packs, fans to 3 reviewers (1 codex + 1 gemini + 1 opencode), waits event-driven (zero token burn) for `## DONE`, loops on disagreement. Auto-modifies git; asks before merge.
+description: Multi-LLM workflow orchestrator with lineage-weighted quorum. Routes to plan / implement / major-bug / minor-bug modes. Builds XML packs, fans to reviewers (1 per enabled lineage), waits for `## DONE` (inotifywait on Linux, poll on macOS — zero token burn), loops on disagreement. Auto-modifies git; asks before merge.
 ---
 
 # /work — multi-LLM workflow
@@ -28,9 +28,9 @@ Which workflow?
 ## Hard rules (non-negotiable)
 
 1. **Never hardcode agent names.** Always call `work pick-agents` (LRU rotation across cdx-1/2/3, automatically uses cdx-4 / gem-2 if added later to `agents.json`).
-2. **Lineage diversity required.** Quorum needs ≥1 codex + ≥1 gemini + ≥1 opencode agreeing. Enforced by `work-converge` — Claude does NOT override the quorum rule lightly.
+2. **Lineage diversity required.** Quorum needs ≥1 agent per enabled lineage agreeing. Lineages are detected from `agents.json` types — disabled or unconfigured lineages don't block quorum. Enforced by `work-converge` — Claude does NOT override the quorum rule lightly.
 3. **`/clear` between different PRs.** Handled automatically by `work` based on `task_id` change. Don't pass `--clear` flags by hand.
-4. **Event-driven wait.** `work review` blocks on `inotifywait` — zero polling, zero tokens during wait. Do NOT add monitoring loops in Claude.
+4. **Event-driven wait.** `work review` blocks on `inotifywait` (Linux) or 5s poll (macOS) — zero tokens during wait. Do NOT add monitoring loops in Claude.
 5. **Auto-modify git** for branch / commit / PR open / push. NEVER auto-merge — always ask user via the pre-merge checklist.
 6. **All user clarification = numbered options, simple English.**
 7. **Disagreement loop**: Claude (the proposer) revises, then re-runs `work review --round N+1`. Reviewers see prior rounds via `--prior-rounds-file`. Max 3 rounds before escalating to user.
