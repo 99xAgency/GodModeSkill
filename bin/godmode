@@ -1,0 +1,55 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+SLUG=$(basename "$(pwd)")
+LAYOUT_FILE=$(mktemp /tmp/godmode-layout-XXXXXXXXXX)
+mv "$LAYOUT_FILE" "${LAYOUT_FILE}.kdl"
+LAYOUT_FILE="${LAYOUT_FILE}.kdl"
+
+cleanup() {
+    rm -f "$LAYOUT_FILE"
+}
+trap cleanup EXIT INT TERM
+
+cat > "$LAYOUT_FILE" <<LAYOUT
+layout {
+    tab name="Fleet · ${SLUG}" focus=true {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        pane split_direction="vertical" {
+            pane name="cdx-1" size="34%" {
+                command "tmux"
+                args "attach" "-t" "cdx-1-${SLUG}"
+            }
+            pane name="claude-sonnet" size="33%" {
+                command "tmux"
+                args "attach" "-t" "claude-sonnet-${SLUG}"
+            }
+            pane name="deepseek" size="33%" {
+                command "tmux"
+                args "attach" "-t" "deepseek-${SLUG}"
+            }
+        }
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+
+    tab name="Status" {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        pane name="agent-status" {
+            command "zsh"
+            args "-lc" "cd ${PWD}; agent-status; echo ''; echo 'Press enter to refresh...'; while read; do clear; agent-status; echo ''; echo 'Press enter to refresh...'; done"
+        }
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+}
+LAYOUT
+
+exec zellij --layout "$LAYOUT_FILE"

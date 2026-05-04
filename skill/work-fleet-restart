@@ -2,9 +2,12 @@
 # work-fleet-restart — kill + respawn LLM tmux sessions with the correct
 # launch flags. Use after changing CLI configs, or to apply a model swap.
 #
+# Sessions are project-scoped: tmux session name = {agent}-{project_slug}.
+# The slug is derived from basename(pwd) or the WORK_PROJECT_SLUG env var.
+#
 # Usage:
-#   work-fleet-restart              # restart gem-1, kimi, deepseek
-#   work-fleet-restart --all        # also restart cdx-1/2/3
+#   work-fleet-restart              # restart non-codex agents (from agents.json)
+#   work-fleet-restart --all        # also restart cdx-* agents
 #   work-fleet-restart kimi         # restart only the named session(s)
 #   work-fleet-restart --dry-run    # show what would happen
 #
@@ -13,6 +16,8 @@
 # and inspect each session's pane first.
 
 set -euo pipefail
+
+AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
 
 DRY_RUN=0
 TARGETS=()
@@ -29,72 +34,83 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Default targets if none specified
+# Default targets: derive from agents.json if no explicit list given.
+# --all includes codex agents; without it, only non-codex are restarted
+# (codex accounts have expensive auth state you don't want to lose casually).
 if [ ${#TARGETS[@]} -eq 0 ]; then
-  TARGETS=(gem-1 kimi deepseek)
-  [ "$INCLUDE_CDX" -eq 1 ] && TARGETS=(cdx-1 cdx-2 cdx-3 gem-1 kimi deepseek)
+  if [ "$INCLUDE_CDX" -eq 1 ]; then
+    mapfile -t TARGETS < <(jq -r '.agents[] | select(.disabled != true) | .name' "$AGENTS_JSON")
+  else
+    mapfile -t TARGETS < <(jq -r '.agents[] | select(.disabled != true) | select(.type != "codex") | .name' "$AGENTS_JSON")
+  fi
 fi
 
+# Project slug — derived from cwd, overridable via env var
+WORK_PROJECT_SLUG="${WORK_PROJECT_SLUG:-$(basename "$(pwd)")}"
+PROJECT_DIR="$(pwd)"
+
 # Launch command for each session — single source of truth.
+# All agents work in $PROJECT_DIR (the cwd when this script was invoked).
+# Reads launch_command + working_dir from agents.json; falls back to
+# hardcoded cases for backwards compatibility.
 launch_for() {
-  case "$1" in
-    cdx-1)
-      echo "bash -lc 'cd ~/dev/codex-bridge ; CODEX_HOME=$HOME/.codex codex ; exec bash'" ;;
-    cdx-2)
-      echo "bash -lc 'cd ~/dev/codex-bridge ; CODEX_HOME=$HOME/.codex-cdx-2 codex ; exec bash'" ;;
-    cdx-3)
-      echo "bash -lc 'cd ~/dev/codex-bridge ; CODEX_HOME=$HOME/.codex-cdx-3 codex ; exec bash'" ;;
-    gem-1)
-      # auto_edit (NOT yolo — yolo can wipe files; reddit horror stories).
-      # auto_edit auto-approves edit tools; shell prompts get caught + approved
-      # by work's runtime guard. Pinned model + GEMINI.md guard rails.
-      echo "bash -lc 'cd ~/dev/gem-session 2>/dev/null || cd ~ ; gemini --approval-mode auto_edit --model gemini-3.1-pro-preview ; echo \"--- exited \$? ---\" ; exec bash'" ;;
-    kimi)
-      # OpenCode Go subscription, Kimi K2.6 (3x limits) — see ~/dev/kimi-session/AGENTS.md
-      echo "bash -lc 'cd ~/dev/kimi-session ; $HOME/.opencode/bin/opencode -m opencode-go/kimi-k2.6 ; echo \"--- exited \$? ---\" ; exec bash'" ;;
-    deepseek)
-      # OpenCode Go subscription, DeepSeek V4 Pro — see ~/dev/deepseek-session/AGENTS.md
-      echo "bash -lc 'cd ~/dev/deepseek-session ; $HOME/.opencode/bin/opencode -m opencode-go/deepseek-v4-pro ; echo \"--- exited \$? ---\" ; exec bash'" ;;
-    *)
-      echo ""; return 1 ;;
-  esac
+  local name="$1"
+  local row
+  row=$(jq -c --arg n "$name" '.agents[] | select(.name == $n)' "$AGENTS_JSON" 2>/dev/null)
+  if [ -n "$row" ]; then
+    local launch_cmd working_dir
+    launch_cmd=$(jq -r '.launch_command // empty' <<<"$row")
+    working_dir=$(jq -r '.working_dir // empty' <<<"$row")
+    # Expand $HOME in values from JSON
+    launch_cmd="${launch_cmd//\$HOME/$HOME}"
+    working_dir="${working_dir//\$HOME/$HOME}"
+    # Default working dir to project dir
+    [ -z "$working_dir" ] || [ "$working_dir" = "\$HOME" ] || [ "$working_dir" = "$HOME" ] && working_dir="$PROJECT_DIR"
+    if [ -n "$launch_cmd" ]; then
+      echo "bash -lc 'cd $working_dir ; $launch_cmd ; echo \"--- exited \$? ---\" ; exec bash'"
+      return 0
+    fi
+  fi
+  echo ""; return 1
 }
 
+echo "▶ Project: $WORK_PROJECT_SLUG  (dir: $PROJECT_DIR)"
 echo "▶ Targets: ${TARGETS[*]}"
 [ "$DRY_RUN" -eq 1 ] && echo "▶ DRY RUN — no sessions will be killed or spawned"
 echo
 
-for sess in "${TARGETS[@]}"; do
-  cmd=$(launch_for "$sess") || {
-    echo "  ✗ $sess — unknown session name, skipping"
+for agent in "${TARGETS[@]}"; do
+  tmux_sess="${agent}-${WORK_PROJECT_SLUG}"
+  cmd=$(launch_for "$agent") || {
+    echo "  ✗ $agent — no launch_command in agents.json, skipping"
     continue
   }
 
   # Pre-flight: warn if session has active work (basic heuristic)
-  if tmux has-session -t "$sess" 2>/dev/null; then
-    pane_tail=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -8 || true)
+  if tmux has-session -t "$tmux_sess" 2>/dev/null; then
+    pane_tail=$(tmux capture-pane -t "$tmux_sess" -p 2>/dev/null | tail -8 || true)
     if echo "$pane_tail" | grep -qiE "Working|Thinking|in progress|generating"; then
-      echo "  ⚠ $sess has activity in pane — review before restart:"
+      echo "  ⚠ $tmux_sess has activity in pane — review before restart:"
       echo "$pane_tail" | sed 's/^/      /'
       if [ "$DRY_RUN" -eq 0 ]; then
-        read -r -p "    Restart $sess anyway? [y/N] " yn </dev/tty || yn=n
+        read -r -p "    Restart $tmux_sess anyway? [y/N] " yn </dev/tty || yn=n
         case "$yn" in
           y|Y) ;;
-          *) echo "  ↷ skipping $sess"; continue ;;
+          *) echo "  ↷ skipping $tmux_sess"; continue ;;
         esac
       fi
     fi
   fi
 
-  echo "  ⌫ killing $sess"
-  [ "$DRY_RUN" -eq 0 ] && tmux kill-session -t "$sess" 2>/dev/null || true
+  echo "  ⌫ killing $tmux_sess"
+  [ "$DRY_RUN" -eq 0 ] && tmux kill-session -t "$tmux_sess" 2>/dev/null || true
   sleep 1
 
-  echo "  ▶ launching $sess"
+  echo "  ▶ launching $tmux_sess"
   if [ "$DRY_RUN" -eq 0 ]; then
-    tmux new-session -d -s "$sess" -x 200 -y 50 "$cmd"
+    tmux new-session -d -s "$tmux_sess" -x 200 -y 50 "$cmd"
     sleep 3
-    tmux has-session -t "$sess" && echo "  ✓ $sess alive" || echo "  ✗ $sess FAILED to launch"
+    tmux has-session -t "$tmux_sess" && echo "  ✓ $tmux_sess alive" || echo "  ✗ $tmux_sess FAILED to launch"
   else
     echo "      cmd: $cmd"
   fi
@@ -103,6 +119,6 @@ done
 
 echo "═════════════════════════════════════════════"
 [ "$DRY_RUN" -eq 0 ] && {
-  echo "Final status:"
-  agent-status 2>&1 | head -12 | sed 's/^/  /'
+  echo "Final status (project: $WORK_PROJECT_SLUG):"
+  WORK_PROJECT_SLUG="$WORK_PROJECT_SLUG" agent-status 2>&1 | head -14 | sed 's/^/  /'
 }

@@ -2,7 +2,7 @@
 
 Open Claude Code and paste everything between the `=====` markers below into a fresh conversation. Claude will ask you which CLIs you have, then install the whole `/work` orchestration system end-to-end.
 
-You'll need permission to run `sudo` for installing system tools (`tmux`, `jq`, `inotify-tools`) if they aren't already on your machine.
+You'll need permission to install system tools (`tmux`, `jq`, and on Linux `inotify-tools`) if they aren't already on your machine.
 
 ---
 
@@ -28,22 +28,27 @@ CODEX (OpenAI ChatGPT subscription)
 GEMINI (Google AI subscription)
   2. Do you have Gemini CLI authed? (yes / no)
 
+CLAUDE CODE (Anthropic — optional additional reviewer)
+  3. Do you have Claude Code CLI with an Anthropic Max subscription? (yes / no)
+
 OPENCODE (Kimi / DeepSeek)
-  3. OpenCode Go subscription, direct API keys, or none? (go / api / none)
+  4. OpenCode Go subscription, direct API keys, or none? (go / api / none)
 
 SYSTEM TOOLS
-  4. tmux installed? (Claude can check via `which tmux`)
-  5. jq installed?
-  6. inotify-tools installed?
+  5. tmux installed? (Claude can check via `which tmux`)
+  6. jq installed?
+  7. inotify-tools installed? (Linux only — macOS uses polling automatically)
 
 PROJECT
   7. Is there a specific project dir you want to use as the default Claude
      working dir? (e.g. ~/dev/myproject) — used for setting up planning/ etc.
 ```
 
-After I reply, install missing system tools with `sudo apt install -y <pkg>` (Ubuntu/Debian) or `brew install <pkg>` (macOS).
+After I reply, install missing system tools:
+- **Linux (Ubuntu/Debian):** `sudo apt install -y tmux jq inotify-tools`
+- **macOS:** `brew install tmux jq coreutils findutils` (inotify-tools is Linux-only; macOS uses polling automatically. GNU coreutils/findutils are required for `gdate`, `gstat`, `gfind`.)
 
-If I don't have at least 3 different model families (1 codex + 1 gemini + 1 opencode), STOP and warn me — `/work`'s lineage quorum requires all three. Ask if I want to install the missing ones first or proceed with a relaxed quorum.
+If I don't have at least 3 different model families, STOP and warn me — `/work`'s lineage quorum requires diversity. Any combination of 3+ families works (codex + gemini + opencode, codex + gemini + claude, etc.). Families I don't have can be disabled in `agents.json` — the quorum adapts automatically. Ask if I want to install missing ones first or proceed with what I have.
 
 ## STEP 2: Clone the source files
 
@@ -109,7 +114,14 @@ For each codex account I have:
 - Copy `~/dev/GodModeSkill/skill/gemini/policies/00-deny-destructive.toml` → `~/.gemini/policies/`
 - Append the contents of `~/dev/GodModeSkill/skill/gemini/GEMINI.snippet.md` to my existing `~/.gemini/GEMINI.md` (or create the file if it doesn't exist).
 
-## STEP 8: Configure OpenCode (if I have it)
+## STEP 8: Configure Claude Code reviewer (if I have it)
+
+If I said "yes" to Claude Code CLI:
+- The claude-sonnet agent runs via `claude --model sonnet --dangerously-skip-permissions`. The `--dangerously-skip-permissions` flag is required so the reviewer can write findings files without modal approval prompts blocking the orchestrator. The reviewer only reads a pack file and writes a single findings file — it does not modify the project.
+- No additional config files needed — Claude Code uses its own CLAUDE.md for project context, not the opencode AGENTS.md.
+- Make sure the `claude-sonnet` entry in `agents.json` is present (it's in the template). If I don't have Claude Code, set `"disabled": true` on that entry or remove it.
+
+## STEP 9: Configure OpenCode (if I have it)
 
 - Merge `~/dev/GodModeSkill/skill/opencode/opencode.snippet.json` into my existing `~/.config/opencode/opencode.json`. The `permission` block is the critical part — `external_directory: allow` is required for reviewers to read /tmp/work-* packs.
 - Create working dirs:
@@ -119,7 +131,7 @@ For each codex account I have:
   cp ~/dev/GodModeSkill/skill/examples/AGENTS.md ~/dev/deepseek-session/AGENTS.md
   ```
 
-## STEP 9: Set up the codex-bridge nudgers
+## STEP 10: Set up the codex-bridge nudgers
 
 `/work` uses tmux nudger scripts to send prompts into each tmux session. The repo doesn't ship these (they're tmux-paste-buffer specific). Create them:
 
@@ -145,20 +157,23 @@ tmux send-keys -t "$SESSION" Enter
 
 Make it executable: `chmod +x ~/dev/codex-bridge/nudge`
 
-Create symlinks for the other CLI types (they all use the same paste-buffer mechanism, just default to different session names):
+Create copies for the other CLI types (they all use the same paste-buffer mechanism, just default to different session names):
 
 ```bash
 cd ~/dev/codex-bridge
-for n in nudge-gem nudge-kimi nudge-deepseek; do
+for n in nudge-gem nudge-kimi nudge-deepseek nudge-claude; do
   cp nudge "$n"
 done
 # Patch each to default to its session name
 sed -i 's|CDX_TMUX_SESSION:-cdx|GEM_TMUX_SESSION:-gem-1|' nudge-gem
 sed -i 's|CDX_TMUX_SESSION:-cdx|KIMI_TMUX_SESSION:-kimi|' nudge-kimi
 sed -i 's|CDX_TMUX_SESSION:-cdx|DEEPSEEK_TMUX_SESSION:-deepseek|' nudge-deepseek
+sed -i 's|CDX_TMUX_SESSION:-cdx|CLAUDE_TMUX_SESSION:-claude-sonnet|' nudge-claude
 ```
 
-## STEP 10: Spawn the tmux sessions
+> **Note for macOS:** use `sed -i '' 's|...|...|'` (BSD sed requires the empty string argument for in-place editing).
+
+## STEP 11: Spawn the tmux sessions
 
 Run `~/.local/bin/work-fleet-restart` to spawn all configured agents:
 
@@ -173,23 +188,23 @@ For OpenCode sessions: tell me to attach and run `opencode providers login` to a
 
 For Gemini: should auth automatically if `~/.gemini/oauth_creds.json` exists.
 
-## STEP 11: Verify
+## STEP 12: Verify
 
 Run these and show me the output:
 
 ```bash
-work pick-agents       # should print 1 codex + 1 gemini + 1 opencode JSON
+work pick-agents       # should print 1 agent per enabled lineage (JSON)
 agent-status            # should show all alive agents
 work --help             # should print subcommand list
 ```
 
 If anything fails, diagnose and fix before continuing.
 
-## STEP 12: Smoke test (optional but recommended)
+## STEP 13: Smoke test (optional but recommended)
 
 If I want, run a tiny `/work` review on a fake task to confirm the pipeline works end-to-end. Use `--mode plan --task "tiny test"` with a 60-second timeout. Tell me what the reviewers said.
 
-## STEP 13: Hand-off
+## STEP 14: Hand-off
 
 Tell me:
 1. `/work` is installed. Try: `/work plan a small feature` or similar.

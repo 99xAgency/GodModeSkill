@@ -7,7 +7,7 @@
 #
 # Subcommands:
 #   work pick-agents [--exclude <a,b>]
-#       → picks 1 codex + 1 gemini + 1 opencode (LRU-rotated). Prints JSON.
+#       → picks 1 per lineage (LRU-rotated). Prints JSON.
 #
 #   work review --mode plan|implement|major-bug --task "..." --task-id <id>
 #               --round <N> [--planning-doc <path>] [--failing-test <path>]
@@ -34,12 +34,20 @@
 
 set -euo pipefail
 
+# macOS compat — use GNU coreutils for date/stat/find
+if [[ "$(uname)" == "Darwin" ]]; then
+  export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:/opt/homebrew/opt/findutils/libexec/gnubin:$PATH"
+fi
+
+# Project slug — scopes tmux session names to the current project directory.
+# All agents.json session names are BASE names; runtime names = base-slug.
+WORK_PROJECT_SLUG="${WORK_PROJECT_SLUG:-$(basename "$(pwd)")}"
+
 AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
 STATE_DIR="$HOME/.work"
 STATE_FILE="$STATE_DIR/state.json"
 LRU_FILE="$STATE_DIR/agent-lru.json"
-sudo mkdir -p "$STATE_DIR" 2>/dev/null || mkdir -p "$STATE_DIR"
-sudo chown -R ubuntu:ubuntu "$STATE_DIR" 2>/dev/null || true
+mkdir -p "$STATE_DIR"
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 [ -f "$LRU_FILE"   ] || echo '{}' > "$LRU_FILE"
 
@@ -57,6 +65,7 @@ cmd_pick_agents() {
   done
 
   # For each lineage, pick the alive agent with the oldest last_used_at (LRU).
+  # Session names are project-scoped: base_name + "-" + slug.
   python3 - <<PYEOF
 import json, subprocess, sys
 from pathlib import Path
@@ -64,16 +73,19 @@ from pathlib import Path
 agents = json.loads(Path("$AGENTS_JSON").read_text())["agents"]
 lru = json.loads(Path("$LRU_FILE").read_text())
 exclude = set("$exclude".split(",")) if "$exclude" else set()
+slug = "$WORK_PROJECT_SLUG"
 
-# Check tmux liveness
-def alive(session):
-    r = subprocess.run(["tmux", "has-session", "-t", session],
+# Check tmux liveness — session name is base + "-" + project slug
+def alive(base_session):
+    scoped = base_session + "-" + slug
+    r = subprocess.run(["tmux", "has-session", "-t", scoped],
                        capture_output=True)
     return r.returncode == 0
 
 picked = {}
 disabled_lineages = []
-for lineage in ("codex", "gemini", "opencode"):
+all_types = sorted(set(a["type"] for a in agents if not a.get("disabled", False)))
+for lineage in all_types:
     pool = [
         a for a in agents
         if a["type"] == lineage
@@ -169,10 +181,6 @@ PYEOF
 
 # ── review subcommand (the main event) ───────────────────────────────────
 cmd_review() {
-  command -v inotifywait >/dev/null || {
-    echo "work review: inotifywait required (sudo apt install inotify-tools)" >&2
-    exit 1
-  }
   local mode="" task="" task_id="" round=1 out=""
   local planning_doc="" failing_test="" failing_test_output=""
   local diff_ref="" prior_rounds_file="" extra_files=""
@@ -266,7 +274,7 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
     [ -z "$row" ] && { echo "  ✗ $name not in agents.json (skipping)" >&2; continue; }
     NUDGE[$name]=$(jq -r '.nudge_command' <<<"$row")
     ENVVAR[$name]=$(jq -r '.tmux_env_var' <<<"$row")
-    SESS[$name]=$(jq -r '.tmux_session' <<<"$row")
+    SESS[$name]="$(jq -r '.tmux_session' <<<"$row")-${WORK_PROJECT_SLUG}"
     TYPE[$name]=$(jq -r '.type' <<<"$row")
     if ! tmux has-session -t "${SESS[$name]}" 2>/dev/null; then
       echo "  ✗ $name tmux session ${SESS[$name]} not alive (skipping)" >&2
@@ -289,11 +297,35 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
   # Per-CLI command:
   #   • Codex + Gemini → /clear
   #   • Opencode      → /new (opencode doesn't have /clear, /new starts a fresh session)
+  #
+  # Opencode /new may trigger a "Select agent" popup (build vs plan picker).
+  # After sending /new to opencode, poll briefly and auto-select "build" if
+  # the popup appears. The config layer (default_agent=build in opencode.json)
+  # should prevent the popup, but this handles it at runtime as a fallback.
   clear_cmd_for() {
     case "$1" in
       opencode) echo "/new" ;;
       *)        echo "/clear" ;;
     esac
+  }
+  handle_opencode_new_popup() {
+    local sess="$1" name="$2"
+    local attempts=0
+    while [ "$attempts" -lt 6 ]; do
+      sleep 0.5
+      local pane
+      pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -15 || true)
+      if echo "$pane" | grep -qE 'Select agent'; then
+        printf '  ↩ %-12s /new agent popup — auto-selecting build\n' "$name" >&2
+        tmux send-keys -t "$sess" "build" 2>/dev/null || true
+        sleep 0.3
+        tmux send-keys -t "$sess" Enter 2>/dev/null || true
+        echo "$name: $(date -Iseconds): /new agent popup — auto-selected build" >> "$out/popup-dismissals.log" 2>/dev/null || true
+        return 0
+      fi
+      attempts=$((attempts + 1))
+    done
+    return 0
   }
   for name in "${VALID[@]}"; do
     needs_clear=0
@@ -305,19 +337,15 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
       cmd=$(clear_cmd_for "${TYPE[$name]}")
       echo "  ⌫ $cmd → $name ($reason)" >&2
       tmux send-keys -t "${SESS[$name]}" "$cmd" Enter 2>/dev/null || true
-      sleep 1
+      if [ "${TYPE[$name]}" = "opencode" ]; then
+        handle_opencode_new_popup "${SESS[$name]}" "$name"
+      else
+        sleep 1
+      fi
     fi
   done
-  # Brief settle if anything was cleared
-  if [ "$clear_first" -eq 1 ] || [ "${#VALID[@]}" -gt 0 ]; then
-    # Only settle if at least one opencode or task changed
-    for name in "${VALID[@]}"; do
-      if [ "${TYPE[$name]}" = "opencode" ] || [ "$clear_first" -eq 1 ]; then
-        sleep 2
-        break
-      fi
-    done
-  fi
+  # Brief settle after clears
+  sleep 1
 
   # Send the nudge to each agent
   for name in "${VALID[@]}"; do
@@ -348,6 +376,19 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
         # OR read the whole file. Pack is also ordered with critical content
         # at the top (task → ask → schema → relevant-code), but we still nudge.
         prompt="Round $round reviewer: read the ENTIRE XML pack at ${pack_path} — your read tool may default to 2000 lines per call but this pack can run 4000-5000 lines, so call read with limit set high (e.g. limit: 6000) OR read in chunks (offset 0, then offset 2000, then offset 4000) to ensure you see the full pack including <relevant-code> and <response-schema>. The pack starts with <task>, <ask>, <response-schema> at the top; the source files you must verify findings against are in <relevant-code><file>...</file> blocks inside <context>. Use your write_file tool (NOT cat or echo or tee or printf, which prompt for shell permission) to write your XML findings to ${out_file}, ending the file with a single line containing exactly: ## DONE — without that the orchestrator hangs. Begin immediately, do NOT ask clarifying questions, do NOT respond conversationally."
+        ;;
+      claude)
+        # Claude Code — multi-line OK, has native Write tool, no permission prompts
+        # with --dangerously-skip-permissions.
+        prompt="Please review the XML context pack at: $pack_path
+
+Read it carefully — the <ask> block tells you what to do, the <response-schema> block tells you the EXACT XML format to return.
+
+When you finish, use your Write tool to create: $out_file
+
+End your file with a single line containing exactly: ## DONE
+
+Failure to end with '## DONE' will leave the orchestrator hanging — please double-check before stopping."
         ;;
       *)
         # Codex (default) — multi-line is fine.
@@ -397,9 +438,14 @@ PYEOF
   done
 
   # ── Wait for ALL findings files to end with `## DONE` ──────────────────
-  # Strategy: blocking inotifywait → zero CPU, zero token burn during wait.
-  # Re-check after each filesystem event. Hard cap: $timeout seconds.
-  echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE' (zero-poll, event-driven)" >&2
+  # Strategy: inotifywait if available (zero-CPU event-driven), else 5s poll.
+  local use_inotify=0
+  command -v inotifywait >/dev/null && use_inotify=1
+  if [ "$use_inotify" -eq 1 ]; then
+    echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE' (event-driven via inotifywait)" >&2
+  else
+    echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE' (polling every 5s)" >&2
+  fi
 
   local start now elapsed
   start=$(date +%s)
@@ -430,10 +476,13 @@ PYEOF
       check_for_errors "$name" >&2
     done
 
-    # Block until ANY findings file changes (or timeout). 5s safety wake to
-    # re-check permission prompts AND provider errors — catches stuck-on-prompt
-    # or errored reviewers fast (was 15s, was 60s before that).
-    inotifywait -qq -e modify -e create "$out/" --timeout 5 2>/dev/null || true
+    # Wait for filesystem change (inotifywait) or poll. 5s wakeup re-checks
+    # permission prompts AND provider errors — catches stuck agents fast.
+    if [ "$use_inotify" -eq 1 ]; then
+      inotifywait -qq -e modify -e create "$out/" --timeout 5 2>/dev/null || true
+    else
+      sleep 5
+    fi
   done
 
   echo "  ✓ All ${done_count}/${#VALID[@]} reviewers done in ${elapsed}s" >&2
@@ -572,11 +621,15 @@ check_and_approve_prompts() {
   fi
 }
 
-# ── Opencode modal-popup dismissal ──────────────────────────────────────
-# When opencode TUI shows a "Select agent" / "Select model" picker (triggered
-# by an @ or / character in the pasted prompt mid-bracketed-paste-split),
-# the input box is blocked until Escape. Without dismissal the nudge text
-# is lost and the agent never starts reviewing.
+# ── Opencode modal-popup dismissal ────────���────────────���────────────────
+# When opencode TUI shows a modal popup (Select agent / Select model /
+# Select session / "No results found") during the review polling loop,
+# it was triggered by a stray @ or / in the pasted prompt at a tmux chunk
+# boundary. The paste text fills the search box with junk (hence "No
+# results found"). Correct action: Escape to dismiss, then re-nudge.
+#
+# NOTE: the post-/new agent-selection popup (empty search, real agent
+# list) is handled separately by handle_opencode_new_popup(), NOT here.
 check_for_popups() {
   local name="$1"
   [ "${TYPE[$name]:-}" != "opencode" ] && return 0
@@ -589,7 +642,7 @@ check_for_popups() {
   local now last
   now=$(date +%s)
   last="${POPUP_DISMISSED_AT[$name]:-0}"
-  # Debounce: don't keep mashing Escape on the same popup frame
+  # Debounce: don't keep hitting the same popup frame
   [ $((now - last)) -lt 10 ] && return 0
   POPUP_DISMISSED_AT[$name]=$now
 
@@ -639,9 +692,9 @@ try_lineage_swap() {
     # Already tried as a swap target this run? skip
     [ "${SWAPPED_TO[$c]:-0}" = "1" ] && continue
 
-    # tmux session alive?
+    # tmux session alive? (scoped: base-slug)
     local sess_name
-    sess_name=$(jq -r --arg n "$c" '.agents[] | select(.name == $n) | .tmux_session' "$AGENTS_JSON")
+    sess_name="$(jq -r --arg n "$c" '.agents[] | select(.name == $n) | .tmux_session' "$AGENTS_JSON")-${WORK_PROJECT_SLUG}"
     tmux has-session -t "$sess_name" 2>/dev/null || continue
 
     partner="$c"
@@ -655,7 +708,7 @@ try_lineage_swap() {
   row=$(jq -c --arg n "$partner" '.agents[] | select(.name == $n)' "$AGENTS_JSON")
   NUDGE[$partner]=$(jq -r '.nudge_command' <<<"$row")
   ENVVAR[$partner]=$(jq -r '.tmux_env_var' <<<"$row")
-  SESS[$partner]=$(jq -r '.tmux_session' <<<"$row")
+  SESS[$partner]="$(jq -r '.tmux_session' <<<"$row")-${WORK_PROJECT_SLUG}"
   TYPE[$partner]=$(jq -r '.type' <<<"$row")
 
   SWAPPED_TO[$partner]=1
@@ -683,8 +736,13 @@ try_lineage_swap() {
   # being a different account/session means it has no carry-over anyway,
   # but a /clear is cheap insurance).
   case "$failed_type" in
-    opencode) tmux send-keys -t "${SESS[$partner]}" "/new" Enter 2>/dev/null || true ; sleep 2 ;;
-    *)        tmux send-keys -t "${SESS[$partner]}" "/clear" Enter 2>/dev/null || true ; sleep 1 ;;
+    opencode)
+      tmux send-keys -t "${SESS[$partner]}" "/new" Enter 2>/dev/null || true
+      handle_opencode_new_popup "${SESS[$partner]}" "$partner"
+      ;;
+    *)
+      tmux send-keys -t "${SESS[$partner]}" "/clear" Enter 2>/dev/null || true ; sleep 1
+      ;;
   esac
   # Defensive Escape in case partner has its own stale popup (opencode)
   tmux send-keys -t "${SESS[$partner]}" Escape 2>/dev/null || true
@@ -783,8 +841,8 @@ cmd_approve() {
   local name="${1:-}"
   [ -z "$name" ] && { echo "work approve <agent>" >&2; return 2; }
   local sess
-  sess=$(jq -r --arg n "$name" '.agents[] | select(.name == $n) | .tmux_session // empty' "$AGENTS_JSON")
-  [ -z "$sess" ] && { echo "work approve: unknown agent '$name'" >&2; return 1; }
+  sess="$(jq -r --arg n "$name" '.agents[] | select(.name == $n) | .tmux_session // empty' "$AGENTS_JSON")-${WORK_PROJECT_SLUG}"
+  [ "$sess" = "-${WORK_PROJECT_SLUG}" ] && { echo "work approve: unknown agent '$name'" >&2; return 1; }
   tmux has-session -t "$sess" 2>/dev/null || { echo "work approve: tmux session '$sess' is dead" >&2; return 1; }
 
   local pane
@@ -830,8 +888,9 @@ cmd_babysit() {
 
   declare -A LAST_APPROVED
   while :; do
-    while IFS=$'\t' read -r name sess type; do
+    while IFS=$'\t' read -r name base_sess type; do
       [ -z "$name" ] && continue
+      sess="${base_sess}-${WORK_PROJECT_SLUG}"
       tmux has-session -t "$sess" 2>/dev/null || continue
       local pane
       pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
@@ -1018,12 +1077,13 @@ cmd_status() {
     # Sort: type alphabetically (codex → gemini → opencode), then name.
     mapfile -t all_agents < <(jq -r '.agents[] | "\(.type)\t\(.name)\t\(.tmux_session)\t\(.disabled // false)"' "$AGENTS_JSON" | sort -t$'\t' -k1,1 -k2,2)
 
-    local row name session is_disabled
+    local row name session base_session is_disabled
     local f mtime elapsed_s elapsed_str done_str bytes pane in_run sess_alive state
     for row in "${all_agents[@]}"; do
       # Format: type \t name \t session \t disabled
       name=$(echo "$row" | cut -f2)
-      session=$(echo "$row" | cut -f3)
+      base_session=$(echo "$row" | cut -f3)
+      session="${base_session}-${WORK_PROJECT_SLUG}"
       is_disabled=$(echo "$row" | cut -f4)
       [ "$is_disabled" = "true" ] && is_disabled=1 || is_disabled=0
       [ -z "$name" ] && continue

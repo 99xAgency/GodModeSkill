@@ -7,8 +7,7 @@ Reads each <agent>-findings.md from <out-dir>, extracts the <findings> block
 and decides whether quorum is reached.
 
 Quorum rule (lineage-weighted):
-  agree if ≥1 codex agent AND ≥1 gemini agent AND ≥1 opencode agent
-  all returned <verdict agree="true">.
+  agree if ≥1 agent of each ENABLED lineage returned <verdict agree="true">.
   Partial verdicts count as agree only if reasoning explicitly says minor-only.
 
 Exit codes:
@@ -155,7 +154,9 @@ def quorum_check(per_agent: dict, agent_types: dict[str, str], disabled: set[str
       severity in {critical, high} (i.e. only nits).
     """
     disabled = disabled or set()
-    by_lineage = {"codex": [], "gemini": [], "opencode": []}
+    # Derive lineages dynamically from agents.json types
+    all_lineages = sorted(set(agent_types.values()))
+    by_lineage = {lin: [] for lin in all_lineages}
     for agent_name, resp in per_agent.items():
         lin = agent_types.get(agent_name)
         if lin not in by_lineage:
@@ -213,7 +214,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out-dir", required=True, help="dir containing <agent>-findings.md files")
     ap.add_argument("--agents", required=True, help="comma-separated list of agents that were nudged")
-    ap.add_argument("--agents-json", default="$HOME/.config/agent-sessions/agents.json")
+    ap.add_argument("--agents-json", default=str(Path.home() / ".config/agent-sessions/agents.json"))
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)

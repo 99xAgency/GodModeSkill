@@ -23,7 +23,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path.home()
-MEMORY_DIR = HOME / ".claude/projects/-home-ubuntu/memory"
+
+def _detect_memory_dir() -> Path:
+    """Auto-detect Claude Code's project memory dir from cwd."""
+    if d := os.environ.get("WORK_MEMORY_DIR"):
+        return Path(d)
+    slug = str(Path.cwd()).replace("/", "-")
+    return HOME / ".claude" / "projects" / slug / "memory"
+
+MEMORY_DIR = _detect_memory_dir()
 JOURNAL_DIR = HOME / ".claude/conversations"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
