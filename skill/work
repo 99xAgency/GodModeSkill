@@ -7,7 +7,7 @@
 #
 # Subcommands:
 #   work pick-agents [--exclude <a,b>]
-#       → picks 1 codex + 1 gemini + 1 opencode (LRU-rotated). Prints JSON.
+#       → picks 1 per lineage (LRU-rotated). Prints JSON.
 #
 #   work review --mode plan|implement|major-bug --task "..." --task-id <id>
 #               --round <N> [--planning-doc <path>] [--failing-test <path>]
@@ -297,11 +297,35 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
   # Per-CLI command:
   #   • Codex + Gemini → /clear
   #   • Opencode      → /new (opencode doesn't have /clear, /new starts a fresh session)
+  #
+  # Opencode /new may trigger a "Select agent" popup (build vs plan picker).
+  # After sending /new to opencode, poll briefly and auto-select "build" if
+  # the popup appears. The config layer (default_agent=build in opencode.json)
+  # should prevent the popup, but this handles it at runtime as a fallback.
   clear_cmd_for() {
     case "$1" in
       opencode) echo "/new" ;;
       *)        echo "/clear" ;;
     esac
+  }
+  handle_opencode_new_popup() {
+    local sess="$1" name="$2"
+    local attempts=0
+    while [ "$attempts" -lt 6 ]; do
+      sleep 0.5
+      local pane
+      pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -15 || true)
+      if echo "$pane" | grep -qE 'Select agent'; then
+        printf '  ↩ %-12s /new agent popup — auto-selecting build\n' "$name" >&2
+        tmux send-keys -t "$sess" "build" 2>/dev/null || true
+        sleep 0.3
+        tmux send-keys -t "$sess" Enter 2>/dev/null || true
+        echo "$name: $(date -Iseconds): /new agent popup — auto-selected build" >> "$out/popup-dismissals.log" 2>/dev/null || true
+        return 0
+      fi
+      attempts=$((attempts + 1))
+    done
+    return 0
   }
   for name in "${VALID[@]}"; do
     needs_clear=0
@@ -313,19 +337,15 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
       cmd=$(clear_cmd_for "${TYPE[$name]}")
       echo "  ⌫ $cmd → $name ($reason)" >&2
       tmux send-keys -t "${SESS[$name]}" "$cmd" Enter 2>/dev/null || true
-      sleep 1
+      if [ "${TYPE[$name]}" = "opencode" ]; then
+        handle_opencode_new_popup "${SESS[$name]}" "$name"
+      else
+        sleep 1
+      fi
     fi
   done
-  # Brief settle if anything was cleared
-  if [ "$clear_first" -eq 1 ] || [ "${#VALID[@]}" -gt 0 ]; then
-    # Only settle if at least one opencode or task changed
-    for name in "${VALID[@]}"; do
-      if [ "${TYPE[$name]}" = "opencode" ] || [ "$clear_first" -eq 1 ]; then
-        sleep 2
-        break
-      fi
-    done
-  fi
+  # Brief settle after clears
+  sleep 1
 
   # Send the nudge to each agent
   for name in "${VALID[@]}"; do
@@ -356,6 +376,19 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
         # OR read the whole file. Pack is also ordered with critical content
         # at the top (task → ask → schema → relevant-code), but we still nudge.
         prompt="Round $round reviewer: read the ENTIRE XML pack at ${pack_path} — your read tool may default to 2000 lines per call but this pack can run 4000-5000 lines, so call read with limit set high (e.g. limit: 6000) OR read in chunks (offset 0, then offset 2000, then offset 4000) to ensure you see the full pack including <relevant-code> and <response-schema>. The pack starts with <task>, <ask>, <response-schema> at the top; the source files you must verify findings against are in <relevant-code><file>...</file> blocks inside <context>. Use your write_file tool (NOT cat or echo or tee or printf, which prompt for shell permission) to write your XML findings to ${out_file}, ending the file with a single line containing exactly: ## DONE — without that the orchestrator hangs. Begin immediately, do NOT ask clarifying questions, do NOT respond conversationally."
+        ;;
+      claude)
+        # Claude Code — multi-line OK, has native Write tool, no permission prompts
+        # with --dangerously-skip-permissions.
+        prompt="Please review the XML context pack at: $pack_path
+
+Read it carefully — the <ask> block tells you what to do, the <response-schema> block tells you the EXACT XML format to return.
+
+When you finish, use your Write tool to create: $out_file
+
+End your file with a single line containing exactly: ## DONE
+
+Failure to end with '## DONE' will leave the orchestrator hanging — please double-check before stopping."
         ;;
       *)
         # Codex (default) — multi-line is fine.
@@ -578,11 +611,15 @@ check_and_approve_prompts() {
   fi
 }
 
-# ── Opencode modal-popup dismissal ──────────────────────────────────────
-# When opencode TUI shows a "Select agent" / "Select model" picker (triggered
-# by an @ or / character in the pasted prompt mid-bracketed-paste-split),
-# the input box is blocked until Escape. Without dismissal the nudge text
-# is lost and the agent never starts reviewing.
+# ── Opencode modal-popup dismissal ────────���────────────���────────────────
+# When opencode TUI shows a modal popup (Select agent / Select model /
+# Select session / "No results found") during the review polling loop,
+# it was triggered by a stray @ or / in the pasted prompt at a tmux chunk
+# boundary. The paste text fills the search box with junk (hence "No
+# results found"). Correct action: Escape to dismiss, then re-nudge.
+#
+# NOTE: the post-/new agent-selection popup (empty search, real agent
+# list) is handled separately by handle_opencode_new_popup(), NOT here.
 check_for_popups() {
   local name="$1"
   [ "${TYPE[$name]:-}" != "opencode" ] && return 0
@@ -595,7 +632,7 @@ check_for_popups() {
   local now last
   now=$(date +%s)
   last="${POPUP_DISMISSED_AT[$name]:-0}"
-  # Debounce: don't keep mashing Escape on the same popup frame
+  # Debounce: don't keep hitting the same popup frame
   [ $((now - last)) -lt 10 ] && return 0
   POPUP_DISMISSED_AT[$name]=$now
 
@@ -689,8 +726,13 @@ try_lineage_swap() {
   # being a different account/session means it has no carry-over anyway,
   # but a /clear is cheap insurance).
   case "$failed_type" in
-    opencode) tmux send-keys -t "${SESS[$partner]}" "/new" Enter 2>/dev/null || true ; sleep 2 ;;
-    *)        tmux send-keys -t "${SESS[$partner]}" "/clear" Enter 2>/dev/null || true ; sleep 1 ;;
+    opencode)
+      tmux send-keys -t "${SESS[$partner]}" "/new" Enter 2>/dev/null || true
+      handle_opencode_new_popup "${SESS[$partner]}" "$partner"
+      ;;
+    *)
+      tmux send-keys -t "${SESS[$partner]}" "/clear" Enter 2>/dev/null || true ; sleep 1
+      ;;
   esac
   # Defensive Escape in case partner has its own stale popup (opencode)
   tmux send-keys -t "${SESS[$partner]}" Escape 2>/dev/null || true

@@ -1,5 +1,5 @@
 {
-  "_comment": "GodModeSkill fleet config. Add/remove agents as you have them. work pick-agents reads this to choose 1 codex + 1 gemini + 1 opencode for each /work review (LRU rotated). Adding more agents (cdx-4, gem-2, etc.) makes them automatically eligible. Use `agent-status set-reset <agent> short|weekly <iso>` to update reset times.",
+  "_comment": "GodModeSkill fleet config. Add/remove agents as you have them. work pick-agents reads this to choose 1 per lineage for each /work review (LRU rotated). Adding more agents (cdx-4, gem-2, claude-opus, etc.) makes them automatically eligible. Use `agent-status set-reset <agent> short|weekly <iso>` to update reset times.",
   "agents": [
     {
       "name": "cdx-1",
@@ -103,6 +103,32 @@
       "tmux_env_var": "KIMI_TMUX_SESSION",
       "launch_command": "$HOME/.opencode/bin/opencode -m opencode-go/kimi-k2.6",
       "working_dir": "$HOME/dev/kimi-session",
+      "priority": 1
+    },
+    {
+      "name": "claude-sonnet",
+      "tmux_session": "claude-sonnet",
+      "type": "claude",
+      "model": "claude-sonnet-4-6",
+      "auth": "subscription",
+      "auth_provider": "Anthropic",
+      "quota_group": "anthropic-acct-1",
+      "balance_endpoint": null,
+      "rate_limits": {
+        "weekly": {
+          "description": "Anthropic Max plan",
+          "next_reset": null
+        },
+        "short": {
+          "description": "Anthropic per-minute token cap",
+          "next_reset": null
+        }
+      },
+      "notes": "Claude Sonnet via Claude Code CLI with --dangerously-skip-permissions. No permission prompts, no modals, native Write tool for file output. Requires Anthropic Max subscription or API key.",
+      "nudge_command": "$HOME/dev/codex-bridge/nudge-claude",
+      "tmux_env_var": "CLAUDE_TMUX_SESSION",
+      "launch_command": "claude --model sonnet --dangerously-skip-permissions",
+      "working_dir": "$HOME",
       "priority": 1
     },
     {

@@ -50,6 +50,8 @@ launch_for() {
       echo "bash -lc 'cd $PROJECT_DIR ; CODEX_HOME=$HOME/.codex codex ; exec bash'" ;;
     kimi)
       echo "bash -lc 'cd $PROJECT_DIR ; $HOME/.opencode/bin/opencode -m openrouter/moonshotai/kimi-k2.6 ; echo \"--- exited \$? ---\" ; exec bash'" ;;
+    claude-sonnet)
+      echo "bash -lc 'cd $PROJECT_DIR ; claude --model sonnet --dangerously-skip-permissions ; echo \"--- exited \$? ---\" ; exec bash'" ;;
     deepseek)
       echo "bash -lc 'cd $PROJECT_DIR ; $HOME/.opencode/bin/opencode -m openrouter/deepseek/deepseek-v4-pro ; echo \"--- exited \$? ---\" ; exec bash'" ;;
     *)
