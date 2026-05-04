@@ -13,6 +13,14 @@
 
 set -euo pipefail
 
+# macOS compat — use GNU coreutils for date/stat
+if [[ "$(uname)" == "Darwin" ]]; then
+  export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
+fi
+
+# Project slug — scopes tmux session names to the current project directory.
+WORK_PROJECT_SLUG="${WORK_PROJECT_SLUG:-$(basename "$(pwd)")}"
+
 CFG_DIR="$HOME/.config/agent-sessions"
 AGENTS="$CFG_DIR/agents.json"
 STATUS="$CFG_DIR/status.json"
@@ -21,7 +29,7 @@ ENV_FILE="$HOME/.config/opencode/.env"
 [ -f "$AGENTS" ] || { echo "missing $AGENTS"; exit 1; }
 [ -f "$ENV_FILE" ] && source "$ENV_FILE"
 
-# ── Subcommand: set-reset ────────────────────────────────────────────────
+# -- Subcommand: set-reset ----------------------------------------------------
 if [ "${1:-}" = "set-reset" ]; then
   agent="${2:-}"; window="${3:-}"; when="${4:-}"
   if [ -z "$agent" ] || [ -z "$window" ] || [ -z "$when" ]; then
@@ -47,9 +55,13 @@ if [ "${1:-}" = "set-reset" ]; then
     # "2026-04-28 22:16:00" expecting their local time, it gets stored as 22:16Z.
     # Fix: detect explicit TZ marker (Z, +HH:MM, -HH:MM); if absent, prefix
     # with TZ="<system local>" so input is parsed as local then converted to UTC.
-    # Detect system tz from /etc/localtime symlink, fall back to /etc/timezone, then UTC.
-    local_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|^.*/zoneinfo/||')
-    [ -z "$local_tz" ] && local_tz=$(cat /etc/timezone 2>/dev/null | tr -d '\n')
+    # Detect system tz — platform-aware.
+    if [[ "$(uname)" == "Darwin" ]]; then
+      local_tz=$(systemsetup -gettimezone 2>/dev/null | sed 's/.*: //' || echo "UTC")
+    else
+      local_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|^.*/zoneinfo/||')
+      [ -z "$local_tz" ] && local_tz=$(cat /etc/timezone 2>/dev/null | tr -d '\n')
+    fi
     [ -z "$local_tz" ] && local_tz="UTC"
 
     if [[ "$when" =~ Z$ ]] || [[ "$when" =~ [+-][0-9]{2}:?[0-9]{2}$ ]]; then
@@ -72,7 +84,7 @@ if [ "${1:-}" = "set-reset" ]; then
   exit 0
 fi
 
-# ── Refresh ──────────────────────────────────────────────────────────────
+# -- Refresh -------------------------------------------------------------------
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 now_epoch="$(date -u +%s)"
 tmp="$(mktemp)"
@@ -93,7 +105,8 @@ echo "{\"updated_at\":\"$now\",\"agents\":[" > "$tmp"
 first=1
 jq -c '.agents[]' "$AGENTS" | while read -r row; do
   name=$(jq -r '.name' <<< "$row")
-  sess=$(jq -r '.tmux_session' <<< "$row")
+  base_sess=$(jq -r '.tmux_session' <<< "$row")
+  sess="${base_sess}-${WORK_PROJECT_SLUG}"
   type=$(jq -r '.type' <<< "$row")
   model=$(jq -r '.model' <<< "$row")
   auth=$(jq -r '.auth' <<< "$row")
@@ -178,8 +191,9 @@ case "${1:-}" in
   --json)  cat "$STATUS"; exit 0 ;;
 esac
 
-# ── Pretty table ─────────────────────────────────────────────────────────
-printf '\n%-10s %-10s %-26s %-5s %-5s %-12s %-9s %-9s\n' \
+# -- Pretty table --------------------------------------------------------------
+printf '\nFleet: %s\n' "$WORK_PROJECT_SLUG"
+printf '%-10s %-10s %-26s %-5s %-5s %-12s %-9s %-9s\n' \
   "AGENT" "TMUX" "MODEL" "ALIVE" "REACH" "BALANCE" "RESET 5H" "RESET WK"
 printf '%s\n' "──────────────────────────────────────────────────────────────────────────────────────────────────"
 jq -r '.agents[] |

@@ -34,12 +34,20 @@
 
 set -euo pipefail
 
+# macOS compat — use GNU coreutils for date/stat/find
+if [[ "$(uname)" == "Darwin" ]]; then
+  export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:/opt/homebrew/opt/findutils/libexec/gnubin:$PATH"
+fi
+
+# Project slug — scopes tmux session names to the current project directory.
+# All agents.json session names are BASE names; runtime names = base-slug.
+WORK_PROJECT_SLUG="${WORK_PROJECT_SLUG:-$(basename "$(pwd)")}"
+
 AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
 STATE_DIR="$HOME/.work"
 STATE_FILE="$STATE_DIR/state.json"
 LRU_FILE="$STATE_DIR/agent-lru.json"
-sudo mkdir -p "$STATE_DIR" 2>/dev/null || mkdir -p "$STATE_DIR"
-sudo chown -R ubuntu:ubuntu "$STATE_DIR" 2>/dev/null || true
+mkdir -p "$STATE_DIR"
 [ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
 [ -f "$LRU_FILE"   ] || echo '{}' > "$LRU_FILE"
 
@@ -57,6 +65,7 @@ cmd_pick_agents() {
   done
 
   # For each lineage, pick the alive agent with the oldest last_used_at (LRU).
+  # Session names are project-scoped: base_name + "-" + slug.
   python3 - <<PYEOF
 import json, subprocess, sys
 from pathlib import Path
@@ -64,16 +73,19 @@ from pathlib import Path
 agents = json.loads(Path("$AGENTS_JSON").read_text())["agents"]
 lru = json.loads(Path("$LRU_FILE").read_text())
 exclude = set("$exclude".split(",")) if "$exclude" else set()
+slug = "$WORK_PROJECT_SLUG"
 
-# Check tmux liveness
-def alive(session):
-    r = subprocess.run(["tmux", "has-session", "-t", session],
+# Check tmux liveness — session name is base + "-" + project slug
+def alive(base_session):
+    scoped = base_session + "-" + slug
+    r = subprocess.run(["tmux", "has-session", "-t", scoped],
                        capture_output=True)
     return r.returncode == 0
 
 picked = {}
 disabled_lineages = []
-for lineage in ("codex", "gemini", "opencode"):
+all_types = sorted(set(a["type"] for a in agents if not a.get("disabled", False)))
+for lineage in all_types:
     pool = [
         a for a in agents
         if a["type"] == lineage
@@ -169,10 +181,6 @@ PYEOF
 
 # ── review subcommand (the main event) ───────────────────────────────────
 cmd_review() {
-  command -v inotifywait >/dev/null || {
-    echo "work review: inotifywait required (sudo apt install inotify-tools)" >&2
-    exit 1
-  }
   local mode="" task="" task_id="" round=1 out=""
   local planning_doc="" failing_test="" failing_test_output=""
   local diff_ref="" prior_rounds_file="" extra_files=""
@@ -266,7 +274,7 @@ print(",".join(v for k, v in d.items() if not k.startswith("_") and isinstance(v
     [ -z "$row" ] && { echo "  ✗ $name not in agents.json (skipping)" >&2; continue; }
     NUDGE[$name]=$(jq -r '.nudge_command' <<<"$row")
     ENVVAR[$name]=$(jq -r '.tmux_env_var' <<<"$row")
-    SESS[$name]=$(jq -r '.tmux_session' <<<"$row")
+    SESS[$name]="$(jq -r '.tmux_session' <<<"$row")-${WORK_PROJECT_SLUG}"
     TYPE[$name]=$(jq -r '.type' <<<"$row")
     if ! tmux has-session -t "${SESS[$name]}" 2>/dev/null; then
       echo "  ✗ $name tmux session ${SESS[$name]} not alive (skipping)" >&2
@@ -397,9 +405,8 @@ PYEOF
   done
 
   # ── Wait for ALL findings files to end with `## DONE` ──────────────────
-  # Strategy: blocking inotifywait → zero CPU, zero token burn during wait.
-  # Re-check after each filesystem event. Hard cap: $timeout seconds.
-  echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE' (zero-poll, event-driven)" >&2
+  # Strategy: poll every 5s. Hard cap: $timeout seconds.
+  echo "▶ Waiting for ${#VALID[@]} reviewer(s) to write '## DONE'" >&2
 
   local start now elapsed
   start=$(date +%s)
@@ -430,10 +437,9 @@ PYEOF
       check_for_errors "$name" >&2
     done
 
-    # Block until ANY findings file changes (or timeout). 5s safety wake to
-    # re-check permission prompts AND provider errors — catches stuck-on-prompt
-    # or errored reviewers fast (was 15s, was 60s before that).
-    inotifywait -qq -e modify -e create "$out/" --timeout 5 2>/dev/null || true
+    # Poll every 5s to re-check permission prompts AND provider errors —
+    # catches stuck-on-prompt or errored reviewers fast.
+    sleep 5
   done
 
   echo "  ✓ All ${done_count}/${#VALID[@]} reviewers done in ${elapsed}s" >&2
@@ -639,9 +645,9 @@ try_lineage_swap() {
     # Already tried as a swap target this run? skip
     [ "${SWAPPED_TO[$c]:-0}" = "1" ] && continue
 
-    # tmux session alive?
+    # tmux session alive? (scoped: base-slug)
     local sess_name
-    sess_name=$(jq -r --arg n "$c" '.agents[] | select(.name == $n) | .tmux_session' "$AGENTS_JSON")
+    sess_name="$(jq -r --arg n "$c" '.agents[] | select(.name == $n) | .tmux_session' "$AGENTS_JSON")-${WORK_PROJECT_SLUG}"
     tmux has-session -t "$sess_name" 2>/dev/null || continue
 
     partner="$c"
@@ -655,7 +661,7 @@ try_lineage_swap() {
   row=$(jq -c --arg n "$partner" '.agents[] | select(.name == $n)' "$AGENTS_JSON")
   NUDGE[$partner]=$(jq -r '.nudge_command' <<<"$row")
   ENVVAR[$partner]=$(jq -r '.tmux_env_var' <<<"$row")
-  SESS[$partner]=$(jq -r '.tmux_session' <<<"$row")
+  SESS[$partner]="$(jq -r '.tmux_session' <<<"$row")-${WORK_PROJECT_SLUG}"
   TYPE[$partner]=$(jq -r '.type' <<<"$row")
 
   SWAPPED_TO[$partner]=1
@@ -783,8 +789,8 @@ cmd_approve() {
   local name="${1:-}"
   [ -z "$name" ] && { echo "work approve <agent>" >&2; return 2; }
   local sess
-  sess=$(jq -r --arg n "$name" '.agents[] | select(.name == $n) | .tmux_session // empty' "$AGENTS_JSON")
-  [ -z "$sess" ] && { echo "work approve: unknown agent '$name'" >&2; return 1; }
+  sess="$(jq -r --arg n "$name" '.agents[] | select(.name == $n) | .tmux_session // empty' "$AGENTS_JSON")-${WORK_PROJECT_SLUG}"
+  [ "$sess" = "-${WORK_PROJECT_SLUG}" ] && { echo "work approve: unknown agent '$name'" >&2; return 1; }
   tmux has-session -t "$sess" 2>/dev/null || { echo "work approve: tmux session '$sess' is dead" >&2; return 1; }
 
   local pane
@@ -830,8 +836,9 @@ cmd_babysit() {
 
   declare -A LAST_APPROVED
   while :; do
-    while IFS=$'\t' read -r name sess type; do
+    while IFS=$'\t' read -r name base_sess type; do
       [ -z "$name" ] && continue
+      sess="${base_sess}-${WORK_PROJECT_SLUG}"
       tmux has-session -t "$sess" 2>/dev/null || continue
       local pane
       pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
@@ -1018,12 +1025,13 @@ cmd_status() {
     # Sort: type alphabetically (codex → gemini → opencode), then name.
     mapfile -t all_agents < <(jq -r '.agents[] | "\(.type)\t\(.name)\t\(.tmux_session)\t\(.disabled // false)"' "$AGENTS_JSON" | sort -t$'\t' -k1,1 -k2,2)
 
-    local row name session is_disabled
+    local row name session base_session is_disabled
     local f mtime elapsed_s elapsed_str done_str bytes pane in_run sess_alive state
     for row in "${all_agents[@]}"; do
       # Format: type \t name \t session \t disabled
       name=$(echo "$row" | cut -f2)
-      session=$(echo "$row" | cut -f3)
+      base_session=$(echo "$row" | cut -f3)
+      session="${base_session}-${WORK_PROJECT_SLUG}"
       is_disabled=$(echo "$row" | cut -f4)
       [ "$is_disabled" = "true" ] && is_disabled=1 || is_disabled=0
       [ -z "$name" ] && continue
