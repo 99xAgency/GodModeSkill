@@ -6,6 +6,21 @@ Codex + Gemini + OpenCode (Kimi/DeepSeek) review your work in parallel. Quorum m
 
 ---
 
+## 👉 Looking for the productized version? Use **Chorus**
+
+GodModeSkill was the bash prototype that proved the multi-LLM peer-review idea. We rebuilt it as a polished cross-platform product:
+
+🎶 **[Chorus](https://chorus.codes)** — `npm install -g chorus-codes`
+
+- Polished cross-platform UI (cockpit at `localhost:5050`) for fan-out reviews + run inspection
+- Works with **any** AI CLI (Claude Code, Codex, Gemini, OpenCode, Kimi, Cursor, Windsurf) via MCP
+- OpenRouter built in, plus per-voice fallback chains, voice auto-disable on quota, and live cost tracking
+- Apache-2.0, open source: **<https://github.com/chorus-codes/chorus>**
+
+GodModeSkill stays here as the original `/work` bash skill for Claude Code users who prefer a script. New features land on Chorus.
+
+---
+
 ## ✨ Why this exists
 
 🤖 **Single-model AI coding fails silently.** Code looks reasonable, tests pass — but a subtle bug or design drift only shows up later.
