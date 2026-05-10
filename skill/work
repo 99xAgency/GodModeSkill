@@ -720,6 +720,18 @@ check_for_errors() {
   local sess="${SESS[$name]:-}"
   [ -z "$sess" ] && return 0
   [ "${ERROR_GAVE_UP[$name]:-0}" = "1" ] && return 0
+
+  # Dead-session check: if tmux session no longer exists and the agent hasn't
+  # written ## DONE, treat as a hard failure — attempt lineage swap immediately.
+  if ! tmux has-session -t "$sess" 2>/dev/null; then
+    tail -3 "$out/${name}-findings.md" 2>/dev/null | grep -qE '^## DONE\s*$' && return 0
+    printf '  ✗ %-12s tmux session dead mid-flight — attempting lineage swap\n' "$name" >&2
+    echo "$name: $(date -Iseconds): tmux session dead, attempting lineage swap" >> "$out/error-retries.log" 2>/dev/null || true
+    ERROR_GAVE_UP[$name]=1
+    try_lineage_swap "$name" || true
+    return 0
+  fi
+
   local pane
   pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
   echo "$pane" | grep -qiE "$ERROR_RE" || return 0
