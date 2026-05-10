@@ -423,6 +423,7 @@ PYEOF
       local any_swapped=0
       for name in "${VALID[@]}"; do
         tail -3 "$out/${name}-findings.md" 2>/dev/null | grep -qE '^## DONE\s*$' && continue
+        [ "${ERROR_GAVE_UP[$name]:-0}" = "1" ] && continue
         local _swap_from="$name" _swap_lin="${TYPE[$name]:-unknown}"
         local swap_reason="timeout"
         if try_lineage_swap "$name"; then
