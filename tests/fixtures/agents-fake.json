@@ -1,0 +1,11 @@
+{
+  "_comment": "Fake fleet for integration tests. Each agent.type covers a lineage. Two per lineage so swap has a target.",
+  "agents": [
+    {"name": "fake-codex-1",   "type": "codex",     "launch_command": "bash tests/fixtures/fake-cli/instant-done.sh"},
+    {"name": "fake-codex-2",   "type": "codex",     "launch_command": "bash tests/fixtures/fake-cli/instant-done.sh"},
+    {"name": "fake-gemini-1",  "type": "gemini",    "launch_command": "bash tests/fixtures/fake-cli/instant-done.sh"},
+    {"name": "fake-gemini-2",  "type": "gemini",    "launch_command": "bash tests/fixtures/fake-cli/instant-done.sh"},
+    {"name": "fake-opencode-1","type": "opencode",  "launch_command": "bash tests/fixtures/fake-cli/instant-done.sh"},
+    {"name": "fake-opencode-2","type": "opencode",  "launch_command": "bash tests/fixtures/fake-cli/instant-done.sh"}
+  ]
+}
