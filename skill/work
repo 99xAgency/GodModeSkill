@@ -423,8 +423,20 @@ PYEOF
       local any_swapped=0
       for name in "${VALID[@]}"; do
         tail -3 "$out/${name}-findings.md" 2>/dev/null | grep -qE '^## DONE\s*$' && continue
+        local _swap_from="$name" _swap_lin="${TYPE[$name]:-unknown}"
+        local swap_reason="timeout"
         if try_lineage_swap "$name"; then
           any_swapped=1
+          SWAP_LOG+=("$(jq -nc \
+            --arg slot "$_swap_from" --arg lineage "$_swap_lin" \
+            --arg from "$_swap_from" --arg to "${SWAP_TRIED[$name]:-unknown}" \
+            --arg reason "$swap_reason" --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{slot:$slot,lineage:$lineage,from:$from,to:$to,reason:$reason,when:$when}')")
+        else
+          DEGRADED_LOG+=("$(jq -nc \
+            --arg slot "$_swap_from" --arg lineage "$_swap_lin" \
+            --arg reason "$swap_reason" \
+            '{slot:$slot,lineage:$lineage,reason:$reason}')")
         fi
       done
       if [ "$any_swapped" = "1" ]; then
@@ -461,6 +473,21 @@ PYEOF
 
   echo "$converge_json" > "$out/converge.json"
 
+  # Enrich converge JSON with substitution/degraded logs before emitting.
+  # Build JSON arrays from bash arrays; empty array → "[]" (not '[""]').
+  local _subs_json _degr_json
+  _subs_json="[$(IFS=,; echo "${SWAP_LOG[*]}")]"
+  _degr_json="[$(IFS=,; echo "${DEGRADED_LOG[*]}")]"
+  local enriched_json
+  enriched_json=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d['substitutions'] = json.loads(sys.argv[2])
+d['degraded'] = json.loads(sys.argv[3])
+print(json.dumps(d))
+" "$converge_json" "$_subs_json" "$_degr_json" 2>/dev/null) || enriched_json="$converge_json"
+  echo "$enriched_json" > "$out/converge.json"
+
   # Update state
   python3 - <<PYEOF
 import json
@@ -472,12 +499,12 @@ s["last_agents"] = "$agents".split(",")
 Path("$STATE_FILE").write_text(json.dumps(s, indent=2))
 PYEOF
 
-  # Print the converge JSON to stdout (Claude consumes this)
-  echo "$converge_json"
+  # Print the enriched converge JSON to stdout (Claude consumes this)
+  echo "$enriched_json"
 
   # Exit code mirrors converge: 0 agree, 1 disagree, 2 incomplete
   local decision
-  decision=$(echo "$converge_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["decision"])' 2>/dev/null || echo "incomplete")
+  decision=$(echo "$enriched_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["decision"])' 2>/dev/null || echo "incomplete")
   case "$decision" in
     agree) exit 0 ;;
     disagree) exit 1 ;;
@@ -526,6 +553,12 @@ declare -A POPUP_DISMISSED_AT # agent -> last unix ts we sent Escape
 # OPENCODE_PARTNER map — works for codex (cdx-1→2→3), gemini (gem-1→2→…),
 # and opencode (kimi→deepseek and reverse).
 declare -A SWAP_TRIED  # "agent_failed" -> "agent_tried_as_replacement"
+
+# Swap outcome logs — accumulated across the watcher loop, emitted in final JSON.
+# SWAP_LOG entries: {slot, lineage, from, to, reason, when}
+# DEGRADED_LOG entries: {slot, lineage, reason}
+declare -a SWAP_LOG=()
+declare -a DEGRADED_LOG=()
 
 # Modal popups that opencode raises mid-flight (Select agent / Select model
 # triggered by stray @ or / in pasted prompt; "No results found" Ask popup).
@@ -728,7 +761,20 @@ check_for_errors() {
     printf '  ✗ %-12s tmux session dead mid-flight — attempting lineage swap\n' "$name" >&2
     echo "$name: $(date -Iseconds): tmux session dead, attempting lineage swap" >> "$out/error-retries.log" 2>/dev/null || true
     ERROR_GAVE_UP[$name]=1
-    try_lineage_swap "$name" || true
+    local _dead_lin="${TYPE[$name]:-unknown}"
+    local swap_reason="tmux_dead"
+    if try_lineage_swap "$name"; then
+      SWAP_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_dead_lin" \
+        --arg from "$name" --arg to "${SWAP_TRIED[$name]:-unknown}" \
+        --arg reason "$swap_reason" --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{slot:$slot,lineage:$lineage,from:$from,to:$to,reason:$reason,when:$when}')")
+    else
+      DEGRADED_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_dead_lin" \
+        --arg reason "$swap_reason" \
+        '{slot:$slot,lineage:$lineage,reason:$reason}')")
+    fi
     return 0
   fi
 
@@ -759,10 +805,21 @@ check_for_errors() {
     # (cdx-1→2→3), gemini (gem-1→2→…), and opencode (kimi⇄deepseek).
     # If a swap succeeds, the failed agent gets a stub-DONE here AND the
     # partner is now reviewing. If no swap candidate is available, escalate.
+    local _err_lin="${TYPE[$name]:-unknown}"
+    local swap_reason="provider_error"
     if try_lineage_swap "$name"; then
       printf '  ✗ %-12s marked done with stub (peer-swap took over)\n' "$name" >&2
+      SWAP_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_err_lin" \
+        --arg from "$name" --arg to "${SWAP_TRIED[$name]:-unknown}" \
+        --arg reason "$swap_reason" --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{slot:$slot,lineage:$lineage,from:$from,to:$to,reason:$reason,when:$when}')")
     else
       printf '  ✗ %-12s provider error AGAIN — no swap candidate, escalating to Claude (stub findings written)\n' "$name" >&2
+      DEGRADED_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_err_lin" \
+        --arg reason "$swap_reason" \
+        '{slot:$slot,lineage:$lineage,reason:$reason}')")
     fi
     echo "$name: $(date -Iseconds): second error, escalating to Claude" >> "$out/error-retries.log" 2>/dev/null || true
     # Escalation: write a stub findings file so the watcher exits its inotify
