@@ -34,8 +34,8 @@
 
 set -euo pipefail
 
-AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
-STATE_DIR="$HOME/.work"
+: "${AGENTS_JSON:=$HOME/.config/agent-sessions/agents.json}"
+: "${STATE_DIR:=$HOME/.work}"
 STATE_FILE="$STATE_DIR/state.json"
 LRU_FILE="$STATE_DIR/agent-lru.json"
 sudo mkdir -p "$STATE_DIR" 2>/dev/null || mkdir -p "$STATE_DIR"
@@ -178,7 +178,7 @@ cmd_review() {
   local diff_ref="" prior_rounds_file="" extra_files=""
   # 10-minute hard cap. Anything longer wastes Claude's context on stale waits.
   # Override per-call with --timeout <sec> if a specific review needs more.
-  local agents="" timeout=600
+  local agents="" timeout="${WORK_TIMEOUT:-600}"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -466,7 +466,7 @@ PYEOF
 
   # ── Run convergence check ─────────────────────────────────────────────
   local converge_json
-  converge_json=$($HOME/.local/bin/work-converge --out-dir "$out" --agents "$agents" 2>&1) || {
+  converge_json=$($HOME/.local/bin/work-converge --out-dir "$out" --agents "$agents" --agents-json "$AGENTS_JSON" 2>&1) || {
     # Non-zero exit codes are fine (1 = disagree, 2 = incomplete) — we still want the JSON
     :
   }
@@ -799,7 +799,7 @@ check_for_errors() {
     # Dismiss any modal toast on opencode before re-nudging.
     [ "${TYPE[$name]:-}" = "opencode" ] && tmux send-keys -t "$sess" Escape 2>/dev/null && sleep 1
     env "${LAST_NUDGE_ENV[$name]}=${SESS[$name]}" "${LAST_NUDGE[$name]}" "${LAST_PROMPT[$name]}" >/dev/null 2>&1 || true
-  elif [ $((now - last)) -ge 60 ]; then
+  elif [ $((now - last)) -ge "${WORK_ERROR_RETRY_DELAY:-60}" ]; then
     ERROR_GAVE_UP[$name]=1
     # First try peer-swap within the same lineage. Works for codex
     # (cdx-1→2→3), gemini (gem-1→2→…), and opencode (kimi⇄deepseek).
