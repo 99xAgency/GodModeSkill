@@ -34,8 +34,8 @@
 
 set -euo pipefail
 
-AGENTS_JSON="$HOME/.config/agent-sessions/agents.json"
-STATE_DIR="$HOME/.work"
+: "${AGENTS_JSON:=$HOME/.config/agent-sessions/agents.json}"
+: "${STATE_DIR:=$HOME/.work}"
 STATE_FILE="$STATE_DIR/state.json"
 LRU_FILE="$STATE_DIR/agent-lru.json"
 sudo mkdir -p "$STATE_DIR" 2>/dev/null || mkdir -p "$STATE_DIR"
@@ -178,7 +178,7 @@ cmd_review() {
   local diff_ref="" prior_rounds_file="" extra_files=""
   # 10-minute hard cap. Anything longer wastes Claude's context on stale waits.
   # Override per-call with --timeout <sec> if a specific review needs more.
-  local agents="" timeout=600
+  local agents="" timeout="${WORK_TIMEOUT:-600}"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -418,6 +418,33 @@ PYEOF
     now=$(date +%s); elapsed=$((now - start))
     if [ "$elapsed" -ge "$timeout" ]; then
       echo "  ✗ TIMEOUT after ${elapsed}s ($done_count/${#VALID[@]} done)" >&2
+      # Before giving up: attempt a lineage swap for each agent that hasn't
+      # written ## DONE. If any swap succeeds, reset the timer and keep waiting.
+      local any_swapped=0
+      for name in "${VALID[@]}"; do
+        tail -3 "$out/${name}-findings.md" 2>/dev/null | grep -qE '^## DONE\s*$' && continue
+        [ "${ERROR_GAVE_UP[$name]:-0}" = "1" ] && continue
+        local _swap_from="$name" _swap_lin="${TYPE[$name]:-unknown}"
+        local swap_reason="timeout"
+        if try_lineage_swap "$name"; then
+          any_swapped=1
+          SWAP_LOG+=("$(jq -nc \
+            --arg slot "$_swap_from" --arg lineage "$_swap_lin" \
+            --arg from "$_swap_from" --arg to "${SWAP_TRIED[$name]:-unknown}" \
+            --arg reason "$swap_reason" --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{slot:$slot,lineage:$lineage,from:$from,to:$to,reason:$reason,when:$when}')")
+        else
+          DEGRADED_LOG+=("$(jq -nc \
+            --arg slot "$_swap_from" --arg lineage "$_swap_lin" \
+            --arg reason "$swap_reason" \
+            '{slot:$slot,lineage:$lineage,reason:$reason}')")
+        fi
+      done
+      if [ "$any_swapped" = "1" ]; then
+        echo "  ⇄ lineage swap(s) performed — resetting timeout" >&2
+        start=$(date +%s)
+        continue
+      fi
       break
     fi
 
@@ -440,12 +467,27 @@ PYEOF
 
   # ── Run convergence check ─────────────────────────────────────────────
   local converge_json
-  converge_json=$($HOME/.local/bin/work-converge --out-dir "$out" --agents "$agents" 2>&1) || {
+  converge_json=$($HOME/.local/bin/work-converge --out-dir "$out" --agents "$agents" --agents-json "$AGENTS_JSON" 2>&1) || {
     # Non-zero exit codes are fine (1 = disagree, 2 = incomplete) — we still want the JSON
     :
   }
 
   echo "$converge_json" > "$out/converge.json"
+
+  # Enrich converge JSON with substitution/degraded logs before emitting.
+  # Build JSON arrays from bash arrays; empty array → "[]" (not '[""]').
+  local _subs_json _degr_json
+  _subs_json="[$(IFS=,; echo "${SWAP_LOG[*]}")]"
+  _degr_json="[$(IFS=,; echo "${DEGRADED_LOG[*]}")]"
+  local enriched_json
+  enriched_json=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+d['substitutions'] = json.loads(sys.argv[2])
+d['degraded'] = json.loads(sys.argv[3])
+print(json.dumps(d))
+" "$converge_json" "$_subs_json" "$_degr_json" 2>/dev/null) || enriched_json="$converge_json"
+  echo "$enriched_json" > "$out/converge.json"
 
   # Update state
   python3 - <<PYEOF
@@ -458,12 +500,12 @@ s["last_agents"] = "$agents".split(",")
 Path("$STATE_FILE").write_text(json.dumps(s, indent=2))
 PYEOF
 
-  # Print the converge JSON to stdout (Claude consumes this)
-  echo "$converge_json"
+  # Print the enriched converge JSON to stdout (Claude consumes this)
+  echo "$enriched_json"
 
   # Exit code mirrors converge: 0 agree, 1 disagree, 2 incomplete
   local decision
-  decision=$(echo "$converge_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["decision"])' 2>/dev/null || echo "incomplete")
+  decision=$(echo "$enriched_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["decision"])' 2>/dev/null || echo "incomplete")
   case "$decision" in
     agree) exit 0 ;;
     disagree) exit 1 ;;
@@ -512,6 +554,12 @@ declare -A POPUP_DISMISSED_AT # agent -> last unix ts we sent Escape
 # OPENCODE_PARTNER map — works for codex (cdx-1→2→3), gemini (gem-1→2→…),
 # and opencode (kimi→deepseek and reverse).
 declare -A SWAP_TRIED  # "agent_failed" -> "agent_tried_as_replacement"
+
+# Swap outcome logs — accumulated across the watcher loop, emitted in final JSON.
+# SWAP_LOG entries: {slot, lineage, from, to, reason, when}
+# DEGRADED_LOG entries: {slot, lineage, reason}
+declare -a SWAP_LOG=()
+declare -a DEGRADED_LOG=()
 
 # Modal popups that opencode raises mid-flight (Select agent / Select model
 # triggered by stray @ or / in pasted prompt; "No results found" Ask popup).
@@ -706,6 +754,31 @@ check_for_errors() {
   local sess="${SESS[$name]:-}"
   [ -z "$sess" ] && return 0
   [ "${ERROR_GAVE_UP[$name]:-0}" = "1" ] && return 0
+
+  # Dead-session check: if tmux session no longer exists and the agent hasn't
+  # written ## DONE, treat as a hard failure — attempt lineage swap immediately.
+  if ! tmux has-session -t "$sess" 2>/dev/null; then
+    tail -3 "$out/${name}-findings.md" 2>/dev/null | grep -qE '^## DONE\s*$' && return 0
+    printf '  ✗ %-12s tmux session dead mid-flight — attempting lineage swap\n' "$name" >&2
+    echo "$name: $(date -Iseconds): tmux session dead, attempting lineage swap" >> "$out/error-retries.log" 2>/dev/null || true
+    ERROR_GAVE_UP[$name]=1
+    local _dead_lin="${TYPE[$name]:-unknown}"
+    local swap_reason="tmux_dead"
+    if try_lineage_swap "$name"; then
+      SWAP_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_dead_lin" \
+        --arg from "$name" --arg to "${SWAP_TRIED[$name]:-unknown}" \
+        --arg reason "$swap_reason" --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{slot:$slot,lineage:$lineage,from:$from,to:$to,reason:$reason,when:$when}')")
+    else
+      DEGRADED_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_dead_lin" \
+        --arg reason "$swap_reason" \
+        '{slot:$slot,lineage:$lineage,reason:$reason}')")
+    fi
+    return 0
+  fi
+
   local pane
   pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null | tail -30 || true)
   echo "$pane" | grep -qiE "$ERROR_RE" || return 0
@@ -727,16 +800,27 @@ check_for_errors() {
     # Dismiss any modal toast on opencode before re-nudging.
     [ "${TYPE[$name]:-}" = "opencode" ] && tmux send-keys -t "$sess" Escape 2>/dev/null && sleep 1
     env "${LAST_NUDGE_ENV[$name]}=${SESS[$name]}" "${LAST_NUDGE[$name]}" "${LAST_PROMPT[$name]}" >/dev/null 2>&1 || true
-  elif [ $((now - last)) -ge 60 ]; then
+  elif [ $((now - last)) -ge "${WORK_ERROR_RETRY_DELAY:-60}" ]; then
     ERROR_GAVE_UP[$name]=1
     # First try peer-swap within the same lineage. Works for codex
     # (cdx-1→2→3), gemini (gem-1→2→…), and opencode (kimi⇄deepseek).
     # If a swap succeeds, the failed agent gets a stub-DONE here AND the
     # partner is now reviewing. If no swap candidate is available, escalate.
+    local _err_lin="${TYPE[$name]:-unknown}"
+    local swap_reason="provider_error"
     if try_lineage_swap "$name"; then
       printf '  ✗ %-12s marked done with stub (peer-swap took over)\n' "$name" >&2
+      SWAP_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_err_lin" \
+        --arg from "$name" --arg to "${SWAP_TRIED[$name]:-unknown}" \
+        --arg reason "$swap_reason" --arg when "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{slot:$slot,lineage:$lineage,from:$from,to:$to,reason:$reason,when:$when}')")
     else
       printf '  ✗ %-12s provider error AGAIN — no swap candidate, escalating to Claude (stub findings written)\n' "$name" >&2
+      DEGRADED_LOG+=("$(jq -nc \
+        --arg slot "$name" --arg lineage "$_err_lin" \
+        --arg reason "$swap_reason" \
+        '{slot:$slot,lineage:$lineage,reason:$reason}')")
     fi
     echo "$name: $(date -Iseconds): second error, escalating to Claude" >> "$out/error-retries.log" 2>/dev/null || true
     # Escalation: write a stub findings file so the watcher exits its inotify
