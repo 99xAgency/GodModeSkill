@@ -92,3 +92,11 @@ GAP-3 is cosmetic — mis-configured agents.json is an operator error, not a run
 
 **Summary: 0 blocking gaps. 2 medium gaps (GAP-1, GAP-2) that are worth fixing in Tasks 2-7
 to improve latency and swap coverage. 1 low gap (GAP-3) that is acceptable to leave.**
+
+---
+
+## Status update — 2026-05-10
+
+- GAP-1: CLOSED in commit 1899f96 — `try_lineage_swap` called for each incomplete agent on timeout; resets timer and continues if any swap performed.
+- GAP-2: CLOSED in commit 590acf2 — `tmux has-session` guard added at top of `check_for_errors`; dead sessions with no `## DONE` immediately attempt lineage swap.
+- GAP-3: DEFERRED (LOW severity; init-time, not hot-path; pre-launch error catches it earlier)
